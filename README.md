@@ -1,6 +1,6 @@
 
 // ========================================================================================
-//                              SISTEM DOSING HIDROPONIK v1.0
+//                              SISTEM DOSING HIDROPONIK v1.3
 // ========================================================================================
 // oleh Syahid Tazia Arabi_F1401221114_Departemen Teknik Mesin dan Biosistem_IPB University
 
@@ -13,6 +13,8 @@
 #include <EEPROM.h>
 #include <avr/wdt.h>             // reset pabrik via watchdog (reset perangkat keras penuh)
 #include <Adafruit_ADS1X15.h>   // ADS1115: ADC eksternal 16-bit via I2C
+#include <SPI.h>
+#include <SdFat.h>              // v1.1: kartu microSD (pustaka SdFat v2.x, Bill Greiman)
 
 // Matikan watchdog sedini mungkin setelah reset (sebelum setup), agar reset via watchdog (Reset Sistem)
 // tidak memicu reset berulang. Dijalankan otomatis oleh startup AVR (
@@ -64,6 +66,114 @@ public:
   size_t write(uint8_t ch){ if(lcdTertahan) return 1; return LiquidCrystal_I2C::write(ch); }
 };
 LcdBertahan          lcd(0x27, 20, 4);
+
+// ── KARTU microSD: RIWAYAT DOSING (v1.1) ──
+// Opsional: tanpa kartu / kartu tak terbaca -> tidak ada pencatatan, sistem tetap berjalan normal.
+#define PIN_SD_CS          53   // SPI Mega: MISO 50, MOSI 51, SCK 52, CS 53
+#define SD_SPI_MHZ          4   // kecepatan SPI aman utk kabel modul yg agak panjang
+#define CSV_DESIMAL_KOMA    1   // 1 = desimal koma & pemisah ';' (Excel bahasa Indonesia); 0 = desimal titik & ','
+#if CSV_DESIMAL_KOMA
+  #define CSV_SEP ';'
+#else
+  #define CSV_SEP ','
+#endif
+#define SD_FOLDER        "/RIWAYAT"
+#define SD_INDEKS        "/RIWAYAT/INDEKS.TXT"   // daftar nama file berurutan waktu (32 byte per catatan)
+#define SD_REKAM_INDEKS   32
+#define SD_KODE_BATAL      9   // kode penutupan catatan: dosing dibatalkan manual
+SdFat32       sd;
+File32        sdLog;                 // file CSV siklus yang sedang berjalan
+bool          sdAda = false;         // kartu terdeteksi (hasil pemeriksaan terakhir)
+bool          sdLogAktif = false;    // file siklus sedang terbuka
+unsigned long sdLogMulaiMs = 0;      // millis() saat catatan siklus dimulai
+int           sdStateTerakhir = -1;  // deteksi pergantian tahap (catatan mulai pompa)
+bool          sdTerkunciPPM = false, sdTerkunciPH = false;   // deteksi median cek baru terkunci
+byte          sdDetikSepi = 0;       // hitungan detik tanpa pembacaan/pompa (baris tiap 10 detik)
+int           sdPolaTerakhir = -1;   // status relay+katup+TDS pada baris terakhir
+// Riwayat Dosing (Pengaturan Sistem)
+int  riwayatSel = 0, riwayatScroll = 0, riwayatJumlah = 0;
+byte riwayatHal = 0;
+bool riwayatKursor = false;          // kursor berkedip LCD sedang menandai baris terpilih
+char riwayatNamaTampil[21];
+struct RingkasanRiwayat {
+  bool fileAda, ada;                 // file ditemukan / baris RINGKASAN ada (siklus tuntas)
+  uint8_t tgl, bln, jam, mnt; uint16_t thn;
+  int durasi, ppm, tPPM;
+  float ph, ab, phml, tPH;
+  uint8_t kode, pf, dosis;
+};
+RingkasanRiwayat riwayatData;
+// ── v1.3: UJI KINERJA (Pengaturan Sistem) — mode pantau untuk grafik waktu vs PPM/pH ──
+// Sampel pantau diambil selama jeda homogenisasi / jeda isi dan selama PANTAU AKHIR sesudah siklus, lalu dicatat
+// ke CSV. Sampel ini TIDAK dipakai algoritma dosing (keputusan dosis tetap hanya dari titik cek). Urutan 1 sampel:
+// D1 bilas -> D1 OFF stabil -> daya TDS ON 5 dtk -> median PPM 10 dtk -> TDS OFF 5 dtk -> median pH 10 dtk.
+bool ujiPantauAktif = false;          // Mode Pantau ON/OFF (EEPROM)
+byte ujiIntervalMenit = 2;            // jarak antarsampel pantau (menit)
+byte ujiKinBilasDetik = 20;              // lama bilas chamber (D1) sebelum tiap sampel pantau (detik)
+byte ujiAkhirMenit = 30;              // lama pantau sesudah siklus selesai (menit, 0 = tanpa)
+const byte UJI_INTERVAL_MIN = 1, UJI_INTERVAL_MAKS = 30;
+const byte UJI_BILAS_MIN = 5,    UJI_BILAS_MAKS = 120;
+const byte UJI_AKHIR_MAKS = 180;
+#define PANTAU_N 10                   // bacaan per median pantau (1 per detik)
+const int PANTAU_JEDA_AWAL = 30;      // sampel pertama di jeda homogenisasi: 30 dtk sesudah jeda dimulai
+byte  pantauFase = 0;                 // 0 diam, 1 bilas, 2 stabil, 3 daya TDS, 4 ukur PPM, 5 stabil pH, 6 ukur pH, 7 catat
+int   pantauDetik = 0;
+long  pantauHitung = 0;               // detik menuju sampel berikutnya
+bool  pantauD1 = false;               // D1 sedang dinyalakan oleh pantau
+bool  pantauLayakSebelum = false;
+byte  pantauN = 0;
+int   pantauBufPPM[PANTAU_N];
+float pantauBufPH[PANTAU_N];
+int   pantauPPMTerakhir = -1;
+float pantauPHTerakhir = -1.0f;
+bool  pantauAkhirAktif = false;       // layar PANTAU AKHIR berjalan (file CSV siklus masih terbuka)
+long  pantauAkhirDetik = 0;
+bool  pantauAkhirAdaDosis = false;
+byte  pantauStopTekan = 0;            // '*' ditekan 2x (dalam 3 dtk) untuk mengakhiri pantau akhir
+bool  ringkasanDitunda = false;       // RINGKASAN CSV ditulis sesudah pantau akhir
+bool  siklusManualUji = false;        // siklus dimulai dari menu Uji Kinerja
+bool  ujiKonfDariPantau = false;
+int   selUjiKinerja = 0, scrollUjiKinerja = 0, selUjiMulai = 1;
+struct RingkasanTunda {               // nilai RINGKASAN saat siklus selesai (ditulis sesudah pantau akhir)
+  bool ada; uint8_t tgl, bln, jam, mnt; uint16_t thn;
+  long durasi; int ppm, tppm; float ph, ab, phml, tph; uint8_t kode, pf, dosis;
+};
+RingkasanTunda rkTunda;
+void pantauTick();
+void pantauBatal();
+bool pantauAkhirBoleh();
+void mulaiPantauAkhir(bool adaDosis);
+void selesaiPantauAkhir(bool lanjutSiklus);
+void prosesPantauAkhir();
+void tampilkanPantauAkhir();
+void teksFasePantau(char* b, size_t n, bool denganNilai);
+void tampilkanMenuUjiKinerja();
+void tampilkanUjiKinInput();
+void tampilkanUjiKinMulaiKonf();
+void sdSimpanRingkasan(bool adaDosis, uint8_t kode);
+void sdTulisRingkasan();
+void sdCatatPantau();
+void eepromMuatUjiKinerja();
+void eepromSimpanUjiKinerja();
+int  pantauStabilDetik();
+int  pantauDurasiDetik();
+long pantauIntervalDetik();
+// prototipe fungsi modul microSD (definisi di bagian v1.1 sebelum LOOP UTAMA)
+void sdWaktuFile(uint16_t* date, uint16_t* time, uint8_t* ms10);
+bool sdMulai();
+void sdMulaiLog();
+void sdLogTick();
+void sdTutupLog(bool adaDosis, uint8_t kode);
+void sdCekKunciMedian();
+void sdCatat(const __FlashStringHelper* t);
+void sdCatatPI(byte kanal, float e, float kp, float ki, float integral, float u);
+void bukaRiwayatDosing();
+void bukaDetailRiwayat();
+void tampilkanRiwayatList();
+void tampilkanRiwayatDetail();
+void kursorRiwayatMati();
+void jagaKursorRiwayat();
+const __FlashStringHelper* teksStatusRiwayat(uint8_t kode, bool adaDosis);
 
 // ── ADS1115 ──
 Adafruit_ADS1115   ads;
@@ -265,6 +375,14 @@ enum MenuState {
     MENU_KUNCI_KANAL,          // status & buka kunci kanal AB / pH
     RESOLUSI_PERINGATAN,       // 1 dtk pompa halus > 1/2 batasan
     KUNCI_KANAL_KONFIRMASI,
+    MENU_RIWAYAT_LIST,         // v1.1: daftar file riwayat dosing (kartu microSD)
+    MENU_RIWAYAT_DETAIL,       // v1.1: rincian satu file riwayat
+    MENU_UJI_KINERJA,          // v1.3: Uji Kinerja (mode pantau)
+    UJI_KIN_INPUT_INTERVAL,
+    UJI_KIN_INPUT_BILAS,
+    UJI_KIN_INPUT_AKHIR,
+    UJI_KIN_MULAI_KONF,        // konfirmasi mulai siklus uji sekarang
+    UJI_PANTAU_AKHIR,          // pemantauan sesudah siklus selesai
 
   MENU_KREDIT
 };
@@ -272,23 +390,26 @@ MenuState currentState = MENU_UTAMA;
 
 bool statusOverlayAktif = false;
 
+// v1.1: ambil teks tabel PROGMEM sebagai __FlashStringHelper (String(), print, += menerima tipe ini)
+#define FPGM(tbl, i) ((const __FlashStringHelper*)pgm_read_word(&(tbl)[i]))
+
 // ================
 // DATA MENU UTAMA 
 // ================
 const int TOTAL_MENU_UTAMA_ROWS = 11;
-const char* menuUtamaOptions[TOTAL_MENU_UTAMA_ROWS] = {
-  "Mulai Dosing",
-  "Status Dosing",
-  "Parameter Aktif",
-  "Parameter Baru",
-  "Parameter Dosing",
-  "PPM/pH Tanaman",
-  "Mode Kalibrasi",
-  "Uji Debit Pompa",
-  "Mode Kalkulator",
-  "Pengaturan Sistem",
-  "Kredit"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char menuUtamaOptions_0[] PROGMEM = "Mulai Dosing";
+const char menuUtamaOptions_1[] PROGMEM = "Status Dosing";
+const char menuUtamaOptions_2[] PROGMEM = "Parameter Aktif";
+const char menuUtamaOptions_3[] PROGMEM = "Parameter Baru";
+const char menuUtamaOptions_4[] PROGMEM = "Parameter Dosing";
+const char menuUtamaOptions_5[] PROGMEM = "PPM/pH Tanaman";
+const char menuUtamaOptions_6[] PROGMEM = "Mode Kalibrasi";
+const char menuUtamaOptions_7[] PROGMEM = "Uji Debit Pompa";
+const char menuUtamaOptions_8[] PROGMEM = "Mode Kalkulator";
+const char menuUtamaOptions_9[] PROGMEM = "Pengaturan Sistem";
+const char menuUtamaOptions_10[] PROGMEM = "Kredit";
+const char* const menuUtamaOptions[TOTAL_MENU_UTAMA_ROWS] PROGMEM = {menuUtamaOptions_0, menuUtamaOptions_1, menuUtamaOptions_2, menuUtamaOptions_3, menuUtamaOptions_4, menuUtamaOptions_5, menuUtamaOptions_6, menuUtamaOptions_7, menuUtamaOptions_8, menuUtamaOptions_9, menuUtamaOptions_10};
 int selMenuUtama    = 0;
 int scrollMenuUtama = 0;
 
@@ -296,19 +417,19 @@ int scrollMenuUtama = 0;
 // DATA MENU A – PARAMETER DOSING 
 // ==============================
 const int TOTAL_MENU_A_ROWS = 11;
-const char* menuAOptions[TOTAL_MENU_A_ROWS] = {
-  "Jenis Larutan",
-  "Volume Tandon",
-  "Target PPM",
-  "Target pH",
-  "Waktu Dosing",
-  "Debit Pompa",
-  "Lama Bilas Sensor",
-  "Jeda Stabilisasi",
-  "Batasan PPM/pH",
-  "Jenis Dosing",
-  "Jeda Homogenisasi"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char menuAOptions_0[] PROGMEM = "Jenis Larutan";
+const char menuAOptions_1[] PROGMEM = "Volume Tandon";
+const char menuAOptions_2[] PROGMEM = "Target PPM";
+const char menuAOptions_3[] PROGMEM = "Target pH";
+const char menuAOptions_4[] PROGMEM = "Waktu Dosing";
+const char menuAOptions_5[] PROGMEM = "Debit Pompa";
+const char menuAOptions_6[] PROGMEM = "Lama Bilas Sensor";
+const char menuAOptions_7[] PROGMEM = "Jeda Stabilisasi";
+const char menuAOptions_8[] PROGMEM = "Batasan PPM/pH";
+const char menuAOptions_9[] PROGMEM = "Jenis Dosing";
+const char menuAOptions_10[] PROGMEM = "Jeda Homogenisasi";
+const char* const menuAOptions[TOTAL_MENU_A_ROWS] PROGMEM = {menuAOptions_0, menuAOptions_1, menuAOptions_2, menuAOptions_3, menuAOptions_4, menuAOptions_5, menuAOptions_6, menuAOptions_7, menuAOptions_8, menuAOptions_9, menuAOptions_10};
 int selMenuA=0, scrollMenuA=0;
 
 // ==========================
@@ -317,41 +438,63 @@ int selMenuA=0, scrollMenuA=0;
 // Data kebutuhan pH & PPM per tanaman (sesuai tabel HidroponikPedia.com)
 struct TanamanData { const char* nama; float ph; int ppm; };
 
+// v1.1: nama tanaman di flash (PROGMEM); dibaca sebagai __FlashStringHelper
+const char nmTanaman0[] PROGMEM = "Artichoke";
+const char nmTanaman1[] PROGMEM = "Asparagus";
+const char nmTanaman2[] PROGMEM = "Bawang Pre";
+const char nmTanaman3[] PROGMEM = "Bayam";
+const char nmTanaman4[] PROGMEM = "Brokoli";
+const char nmTanaman5[] PROGMEM = "Brussel Kecambah";
+const char nmTanaman6[] PROGMEM = "Endive";
+const char nmTanaman7[] PROGMEM = "Kailan";
+const char nmTanaman8[] PROGMEM = "Kangkung";
+const char nmTanaman9[] PROGMEM = "Kubis";
+const char nmTanaman10[] PROGMEM = "Kubis Bunga";
+const char nmTanaman11[] PROGMEM = "Pakcoy";
+const char nmTanaman12[] PROGMEM = "Sawi Manis";
+const char nmTanaman13[] PROGMEM = "Sawi Pahit";
+const char nmTanaman14[] PROGMEM = "Seledri";
+const char nmTanaman15[] PROGMEM = "Selada";
+const char nmTanaman16[] PROGMEM = "Silverbeet";
 const TanamanData dataSayuranDaun[17] PROGMEM = {
-  {"Artichoke",6.5f,560},        {"Asparagus",6.0f,980},
-  {"Bawang Pre",6.5f,980},       {"Bayam",6.0f,1260},
-  {"Brokoli",6.0f,1960},         {"Brussel Kecambah",6.5f,1750},
-  {"Endive",5.5f,1400},          {"Kailan",5.5f,1050},
-  {"Kangkung",5.5f,1050},        {"Kubis",6.5f,1750},
-  {"Kubis Bunga",6.5f,1750},     {"Pakcoy",7.0f,1050},
-  {"Sawi Manis",5.5f,1050},      {"Sawi Pahit",6.0f,840},
-  {"Seledri",6.5f,1260},         {"Selada",6.0f,560},
-  {"Silverbeet",6.0f,1260}
+  {nmTanaman0,6.5f,560},        {nmTanaman1,6.0f,980},
+  {nmTanaman2,6.5f,980},       {nmTanaman3,6.0f,1260},
+  {nmTanaman4,6.0f,1960},         {nmTanaman5,6.5f,1750},
+  {nmTanaman6,5.5f,1400},          {nmTanaman7,5.5f,1050},
+  {nmTanaman8,5.5f,1050},        {nmTanaman9,6.5f,1750},
+  {nmTanaman10,6.5f,1750},     {nmTanaman11,7.0f,1050},
+  {nmTanaman12,5.5f,1050},      {nmTanaman13,6.0f,840},
+  {nmTanaman14,6.5f,1260},         {nmTanaman15,6.0f,560},
+  {nmTanaman16,6.0f,1260}
 };
 
 // Bibit/Persemaian: nama & pH sama dgn Sayuran Daun, PPM seluruhnya 400
 const TanamanData dataBibit[17] PROGMEM = {
-  {"Artichoke",6.5f,400},        {"Asparagus",6.0f,400},
-  {"Bawang Pre",6.5f,400},       {"Bayam",6.0f,400},
-  {"Brokoli",6.0f,400},          {"Brussel Kecambah",6.5f,400},
-  {"Endive",5.5f,400},           {"Kailan",5.5f,400},
-  {"Kangkung",5.5f,400},         {"Kubis",6.5f,400},
-  {"Kubis Bunga",6.5f,400},      {"Pakcoy",7.0f,400},
-  {"Sawi Manis",5.5f,400},       {"Sawi Pahit",6.0f,400},
-  {"Seledri",6.5f,400},          {"Selada",6.0f,400},
-  {"Silverbeet",6.0f,400}
+  {nmTanaman0,6.5f,400},        {nmTanaman1,6.0f,400},
+  {nmTanaman2,6.5f,400},       {nmTanaman3,6.0f,400},
+  {nmTanaman4,6.0f,400},          {nmTanaman5,6.5f,400},
+  {nmTanaman6,5.5f,400},           {nmTanaman7,5.5f,400},
+  {nmTanaman8,5.5f,400},         {nmTanaman9,6.5f,400},
+  {nmTanaman10,6.5f,400},      {nmTanaman11,7.0f,400},
+  {nmTanaman12,5.5f,400},       {nmTanaman13,6.0f,400},
+  {nmTanaman14,6.5f,400},          {nmTanaman15,6.0f,400},
+  {nmTanaman16,6.0f,400}
 };
 
 // Dua kategori: 0 = Bibit/Persemaian, 1 = Tanaman Dewasa (Sayuran Daun)
 const TanamanData* const kategoriTanamanData[2] = { dataBibit, dataSayuranDaun };
 const int kategoriTanamanTotal[2] = {17, 17};
-const char* tanamanKategoriJudul[2] = { "BIBIT/PERSEMAIAN", "SAYURAN DAUN" };
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char tanamanKategoriJudul_0[] PROGMEM = "BIBIT/PERSEMAIAN";
+const char tanamanKategoriJudul_1[] PROGMEM = "SAYURAN DAUN";
+const char* const tanamanKategoriJudul[2] PROGMEM = {tanamanKategoriJudul_0, tanamanKategoriJudul_1};
 
 // Menu pilih fase tanaman
 const int TOTAL_PPM_PH_TANAMAN_ROWS = 2;
-const char* ppmPhTanamanOptions[TOTAL_PPM_PH_TANAMAN_ROWS] = {
-  "Bibit/Persemaian","Tanaman Dewasa"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char ppmPhTanamanOptions_0[] PROGMEM = "Bibit/Persemaian";
+const char ppmPhTanamanOptions_1[] PROGMEM = "Tanaman Dewasa";
+const char* const ppmPhTanamanOptions[TOTAL_PPM_PH_TANAMAN_ROWS] PROGMEM = {ppmPhTanamanOptions_0, ppmPhTanamanOptions_1};
 int selPPMPHTanaman=0, scrollPPMPHTanaman=0;
 
 int selTanamanKategori=0;
@@ -404,9 +547,14 @@ int terpilihConcPersen = 0;
 // DATA MENU B – KALIBRASI
 // ========================
 const int TOTAL_MENU_B_ROWS = 6;
-const char* menuBOptions[TOTAL_MENU_B_ROWS] = {
-  "Sensor TDS","Sensor pH","Sensor Water Level","Sensor Suhu","Tes Sensor TDS","Tes Sensor pH"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char menuBOptions_0[] PROGMEM = "Sensor TDS";
+const char menuBOptions_1[] PROGMEM = "Sensor pH";
+const char menuBOptions_2[] PROGMEM = "Sensor Water Level";
+const char menuBOptions_3[] PROGMEM = "Sensor Suhu";
+const char menuBOptions_4[] PROGMEM = "Tes Sensor TDS";
+const char menuBOptions_5[] PROGMEM = "Tes Sensor pH";
+const char* const menuBOptions[TOTAL_MENU_B_ROWS] PROGMEM = {menuBOptions_0, menuBOptions_1, menuBOptions_2, menuBOptions_3, menuBOptions_4, menuBOptions_5};
 int selMenuB=0, scrollMenuB=0;
 int rtcInput[6]={0,0,0,0,0,0};
 // ── KALIBRASI AKTIF (dipakai pembacaan sensor) ──
@@ -470,11 +618,16 @@ float tesSensorHasilPH    = 0.0f;
 // DATA MENU C – UJI DEBIT POMPA
 // ==============================
 const int TOTAL_UJI_OPTIONS = 8;
-const char* ujiOptions[TOTAL_UJI_OPTIONS] = {
-  "Pompa D1","Pompa D2","Pompa D3",
-  "Pompa P1","Pompa P2","Pompa P3",
-  "Katup Solenoid","Input Debit Pompa"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char ujiOptions_0[] PROGMEM = "Pompa D1";
+const char ujiOptions_1[] PROGMEM = "Pompa D2";
+const char ujiOptions_2[] PROGMEM = "Pompa D3";
+const char ujiOptions_3[] PROGMEM = "Pompa P1";
+const char ujiOptions_4[] PROGMEM = "Pompa P2";
+const char ujiOptions_5[] PROGMEM = "Pompa P3";
+const char ujiOptions_6[] PROGMEM = "Katup Solenoid";
+const char ujiOptions_7[] PROGMEM = "Input Debit Pompa";
+const char* const ujiOptions[TOTAL_UJI_OPTIONS] PROGMEM = {ujiOptions_0, ujiOptions_1, ujiOptions_2, ujiOptions_3, ujiOptions_4, ujiOptions_5, ujiOptions_6, ujiOptions_7};
 
 const int TOTAL_PUMP_OPTIONS = 6;
 const char* pumpOptions[TOTAL_PUMP_OPTIONS] = {
@@ -525,9 +678,10 @@ int selDebitPump=0, scrollDebitPump=0;
 // DATA MENU D – KALKULATOR
 // =========================
 const int TOTAL_MENU_D_ROWS = 2;
-const char* menuDOptions[TOTAL_MENU_D_ROWS] = {
-  "Tinggi Water Level","PPM/pH dari Input"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char menuDOptions_0[] PROGMEM = "Tinggi Water Level";
+const char menuDOptions_1[] PROGMEM = "PPM/pH dari Input";
+const char* const menuDOptions[TOTAL_MENU_D_ROWS] PROGMEM = {menuDOptions_0, menuDOptions_1};
 int selMenuD=0, scrollMenuD=0;
 const char* kalkInputOptions[2] = {"PPM","pH"};
 int selKalkInput=0;
@@ -680,10 +834,16 @@ int selPengaturanSistem = 0;
 int scrollPengaturanSistem = 0;
 
 // Opsi Pengaturan Sistem (4 item). TES_121: "Tuning PI" dihapus — Kp/Ki CL Auto-Tune selalu dihitung dari persamaan.
-const int TOTAL_PENGATURAN_SISTEM_ROWS = 5;
-const char* pengaturanSistemOptions[TOTAL_PENGATURAN_SISTEM_ROWS] = {
-  "Persamaan Nutrisi","Waktu RTC","Kp/Ki PI ZN","Kunci Kanal","Reset Sistem"
-};
+const int TOTAL_PENGATURAN_SISTEM_ROWS = 7;
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char pengaturanSistemOptions_0[] PROGMEM = "Persamaan Nutrisi";
+const char pengaturanSistemOptions_1[] PROGMEM = "Waktu RTC";
+const char pengaturanSistemOptions_2[] PROGMEM = "Kp/Ki PI ZN";
+const char pengaturanSistemOptions_3[] PROGMEM = "Kunci Kanal";
+const char pengaturanSistemOptions_4[] PROGMEM = "Riwayat Dosing";
+const char pengaturanSistemOptions_5[] PROGMEM = "Uji Kinerja";       // v1.3
+const char pengaturanSistemOptions_6[] PROGMEM = "Reset Sistem";
+const char* const pengaturanSistemOptions[TOTAL_PENGATURAN_SISTEM_ROWS] PROGMEM = {pengaturanSistemOptions_0, pengaturanSistemOptions_1, pengaturanSistemOptions_2, pengaturanSistemOptions_3, pengaturanSistemOptions_4, pengaturanSistemOptions_5, pengaturanSistemOptions_6};
 int selKunciKanal = 0, selKunciKonf = 1;
 int selResetSistemConfirm = 1;  
 
@@ -743,9 +903,11 @@ int dosingTargetTahun = 2026;
 // dosingMode (nilai internal tetap demi EEPROM): 1 = Open Loop D85%+P15%, 3 = Closed Loop Auto-Tune (Kp/Ki dari model),
 //                                                4 = Closed Loop PI ZN (Kp/Ki dari uji reaksi Ziegler-Nichols)
 const int TOTAL_JENIS_DOSING_OPTIONS = 3;
-const char* jenisDosingOptions[TOTAL_JENIS_DOSING_OPTIONS] = {
-  "Open Loop","CL Auto-Tune","CL PI ZN"
-};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char jenisDosingOptions_0[] PROGMEM = "Open Loop";
+const char jenisDosingOptions_1[] PROGMEM = "CL Auto-Tune";
+const char jenisDosingOptions_2[] PROGMEM = "CL PI ZN";
+const char* const jenisDosingOptions[TOTAL_JENIS_DOSING_OPTIONS] PROGMEM = {jenisDosingOptions_0, jenisDosingOptions_1, jenisDosingOptions_2};
 int selJenisDosing = 0;
 
 int  dosingMode    = 1;
@@ -836,7 +998,6 @@ PIController piPPM_ZN = {0.0f, 0.0f, 0.0f};
 float piPHKpAtas_ZN = 0.0f, piPHKiAtas_ZN = 0.0f;
 float piPHKpBawah_ZN = 0.0f, piPHKiBawah_ZN = 0.0f;
 
-const float FRAKSI_AMAN_ZN = 0.5f;   // batas atas fraksi penutupan error / iterasi
 
 // -- Poin 1: signature konfigurasi yang mempengaruhi Kp/Ki --
 struct SignatureKpKi {
@@ -884,7 +1045,6 @@ int     hasilUjiPPMAcuan = 0;              // PPM acuan hasil uji terakhir (kana
 uint8_t znKanalLama[2] = {0,0};            // TES_144: [profil] bit kanal (1 PPM, 2 pH atas, 4 pH bawah) hasil uji konfigurasi lama
 const int UJI_VOL_MIN = 10, UJI_VOL_MAKS = 3000;
 const int ZN_TOL_PPM_SKALA = 30;           // |PPM uji - target| <= toleransi sensor TDS (+/-30 PPM) -> tanpa skala PPM
-const float ZN_RASIO_KI_AKAR_RIIL = 0.25f; // Ki <= 0.25.g.Kp^2 (b <= a^2/4, a = g.Kp, b = g.Ki): akar PI per iterasi riil
 
 int selZNHub=0;
 int halKpKiZN=0;          // 0=PPM, 1=pH Atas, 2=pH Bawah — poin 3
@@ -975,8 +1135,16 @@ float ujiRegY0 = 0.0f, ujiRegSx = 0.0f, ujiRegSy = 0.0f, ujiRegSxx = 0.0f, ujiRe
 float ujiRegXAkhir = 0.0f;
 
 
-const char* znHubOptions[3] = {"Uji Reaksi Baru","Rekaman Terakhir","Lihat Kp/Ki Aktif"};   // TES_145: + Rekaman Terakhir
-const char* ujiKanalOptions[3] = {"PPM (AB Mix)","pH Fase Atas","pH Fase Bawah"};
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char znHubOptions_0[] PROGMEM = "Uji Reaksi Baru";
+const char znHubOptions_1[] PROGMEM = "Rekaman Terakhir";
+const char znHubOptions_2[] PROGMEM = "Lihat Kp/Ki Aktif";
+const char* const znHubOptions[3] PROGMEM = {znHubOptions_0, znHubOptions_1, znHubOptions_2};   // TES_145: + Rekaman Terakhir
+// v1.1: teks di flash (PROGMEM) -> hemat RAM
+const char ujiKanalOptions_0[] PROGMEM = "PPM (AB Mix)";
+const char ujiKanalOptions_1[] PROGMEM = "pH Fase Atas";
+const char ujiKanalOptions_2[] PROGMEM = "pH Fase Bawah";
+const char* const ujiKanalOptions[3] PROGMEM = {ujiKanalOptions_0, ujiKanalOptions_1, ujiKanalOptions_2};
 bool piPPMSelesai = false, piPHSelesai = false;
 
 int dosingJedaHomogenisasi[6] = {0,0,0,0,0,0};   // [0..3] = J1..J4, [4] = J0 (TES_134), [5] cadangan
@@ -1319,9 +1487,10 @@ void  prosesKonfirmasiUjiZN(char key);
 void tampilkanDosingInputLamaCek();
 void tampilkanDosingInputStabilisasi();
 void terapkanJenisDosing(int mode, int persen);
-float piHitungPulsa(float error, PIController &pi, float uMaks);
+float piHitungPulsa(float error, PIController &pi, float uMaks, float dtI);
+extern bool piPulsaJenuh;
 void  piReset();
-void  batasiKpZNDenganGainModel(PIController &pi, int kanal);
+void  terapkanKpKiZNDosing(PIController &pi, int kanal);
 void  hitungKonstantaPIOtomatis();
 void  siapkanFasePompaPiAB();
 void  siapkanFasePompaPiPH();
@@ -1333,6 +1502,7 @@ void konfirmasiSukses(String msg, MenuState nextState);
 void konfirmasiParam(String msg, MenuState nextState);
 void handleRTCField(char key, int idx, int minV, int maxV, MenuState nextState, int nextIdx);
 bool isiNilaiAwalInput(MenuState s, MenuState asal);
+bool pantauStateSiklus(MenuState st);   // v1.3 (perbaikan kompilasi): prototipe wajib, sama seperti fungsi MenuState lain
 bool rtcSiapUntukMulai();
 void infoKanalTerkunciSaatMulai();
 void mintaSimpanKanalZN(int kanal, float kp, float ki, MenuState kembali, float volRef, int ppmRef);
@@ -1404,7 +1574,6 @@ void tampilkanRekapDosing();
 void prosesRekapDosing();
 void komitParameterBaruLaluMulai();
 void eepromSimpanRekamCek();
-float kpMaksModel(int kanal, bool baru);
 const __FlashStringHelper* teksPIFlag(uint8_t pf);
 const __FlashStringHelper* teksCatatan(uint8_t pf);
 void tampilkanPeringatanResolusi();
@@ -1679,6 +1848,7 @@ void konfirmasiSuksesInti(String msg, MenuState nextState, bool catatanBaru) {
     case SUB_MENU_D:           tampilkanSubMenuD(); break;
     case MENU_JENIS_LARUTAN:   tampilkanMenuJenisLarutan(); break;
     case MENU_PENGATURAN_SISTEM: tampilkanMenuPengaturanSistem(); break;
+    case MENU_UJI_KINERJA:     tampilkanMenuUjiKinerja(); break;   // v1.3
     case MENU_ZN_HUB:          tampilkanMenuZNHub(); break;
     case MENU_TANAMAN_LIST:    tampilkanMenuTanamanList(); break;
     case MENU_LIHAT_KPKI_ZN:   tampilkanKpKiZN(); break;
@@ -2832,12 +3002,14 @@ void jadwalkanCekBerikutnya(){
 // Mulai satu siklus cek harian: isi tandon -> cek PPM -> (dosing AB bila perlu) -> cek pH -> (dosing pH bila perlu)
 // Dipakai saat jadwal tercapai DAN saat daya pulih di tengah siklus (gerbang batasan mencegah dosis ganda).
 void mulaiSiklusCekHarian() {
+  if(pantauAkhirAktif) selesaiPantauAkhir(true);   // v1.3: pantau akhir siklus sebelumnya diakhiri & file ditutup
+  pantauBatal(); pantauLayakSebelum = false;
   // Dipicu saat user sedang di menu lain -> beri tahu bahwa menu ditutup otomatis
   bool dariMenuLain = !(currentState==DOSING_TUNGGU_WAKTU || currentState==DOSING_TUNDA_KALIBRASI ||
                         currentState==DOSING_FINAL_STATUS || currentState==DOSING_REKAP ||
-                        statusFaseDosingBerjalan(currentState));
+                        currentState==UJI_PANTAU_AKHIR || statusFaseDosingBerjalan(currentState));
   matikanSemuaPompa();             // hentikan tes pompa / uji reaksi / bilas tes sensor yg mungkin berjalan
-  if(dariMenuLain && !statusOverlayAktif && !cancelConfirmAktif){
+  if(dariMenuLain && !siklusManualUji && !statusOverlayAktif && !cancelConfirmAktif){
     lcd.clear();
     lcdPrintCenter(1, F("WAKTU CEK HARIAN"));
     lcdPrintCenter(2, F("Menu ditutup"));
@@ -2856,6 +3028,9 @@ void mulaiSiklusCekHarian() {
   isiTandonDetikBerjalan = 0;
   isiAdaAirBaru = false;
   eepromAutoSimpan();   // persist: siklus sedang berjalan (untuk lanjut otomatis bila daya mati)
+  sdMulaiLog();         // v1.1: file CSV siklus ini (bila kartu microSD terpasang)
+  if(siklusManualUji) sdCatat(F("Siklus dimulai manual (Uji Kinerja)"));   // v1.3
+  siklusManualUji = false;
   currentState = DOSING_ISI_TANDON;
   if(cancelConfirmAktif){ lcd.clear(); tampilkanCancelDosing(); }        // overlay batal tetap di depan
   else if(!statusOverlayAktif){ lcd.clear(); tampilkanDosingIsiTandon(); }
@@ -2883,6 +3058,8 @@ bool cekPerluPerhatian(){ return kodeErrCek()!=CEK_ERR_TIDAK || piFlagCek()!=0 |
 
 // Catat hasil siklus (berhasil / gagal) ke rekam cek terakhir & EEPROM, lalu jadwalkan cek berikutnya.
 void catatHasilSiklus(bool adaDosis, uint8_t kodeErr){
+  if(ringkasanDitunda) sdSimpanRingkasan(adaDosis, kodeErr);   // v1.3: file tetap terbuka utk pantau akhir
+  else                 sdTutupLog(adaDosis, kodeErr);         // v1.1: ringkasan & tutup file CSV siklus
   cekTerakhir.magic    = REKAM_CEK_MAGIC;
   cekTerakhir.ppm      = statusPPMTerakhir;
   cekTerakhir.ph       = statusPHTerakhir;
@@ -2914,6 +3091,8 @@ void selesaikanSiklusCek(bool adaDosis){
   makroPulih = 0;   // TES_138
   relayOff(PIN_RELAY_D1);
   matikanRelayTDS();
+  pantauBatal();
+  ringkasanDitunda = pantauAkhirBoleh();   // v1.3: pantau akhir -> RINGKASAN ditulis sesudahnya
   catatHasilSiklus(adaDosis, responLambatSiklus ? CEK_ERR_LAMBAT : CEK_ERR_TIDAK);   // TES_137
   byte flag = hitungFlagCek();
   uint8_t pf = piFlagCek();
@@ -2940,6 +3119,12 @@ void selesaikanSiklusCek(bool adaDosis){
   }
   statusOverlayAktif = false; statusHalaman = 0;
   cancelConfirmAktif = false;    // siklus sudah selesai -> overlay batal (bila terbuka) tak berlaku lagi
+  if(ringkasanDitunda && sdLogAktif){   // v1.3: lanjut PANTAU AKHIR (rekap/status ditampilkan sesudahnya)
+    ringkasanDitunda = false;
+    mulaiPantauAkhir(adaDosis);
+    return;
+  }
+  ringkasanDitunda = false;
   lcd.clear();
   if(adaDosis){
     currentState = DOSING_REKAP;
@@ -3042,6 +3227,7 @@ unsigned long tombolTerakhirMs = 0;
 bool diMenuLain(){
   return !(statusFaseDosingBerjalan(currentState) || currentState==DOSING_TUNDA_KALIBRASI ||
            currentState==DOSING_FINAL_STATUS || currentState==DOSING_REKAP ||
+           currentState==UJI_PANTAU_AKHIR || (currentState==UJI_KIN_MULAI_KONF && pantauAkhirAktif) ||   // v1.3
            currentState==DOSING_TANDON_TIMEOUT || currentState==DOSING_SENSOR_INVALID);
 }
 void resetTawaranTiba(){ tibaFase = 0; promptTibaAktif = false; lcdTertahan = false; ujiBatalTundaJudul = NULL; }
@@ -3100,7 +3286,8 @@ bool menuSedangProses(){
          currentState==TES_SENSOR_PROSES || (currentState==MENU_TES_SOLENOID && solenoidTerbuka) ||
          currentState==UJI_ZN_LOGGING || currentState==UJI_ZN_KONFIRMASI || sedangKalibrasiBuffer() ||
          (currentState==ZN_KONFIRMASI_JADWAL && znTundaDariUji) ||   // TES_144: hasil uji menunggu jawaban
-         (currentState==MENU_WATER_LEVEL && (wlIsiAktif || solenoidTerbuka));   // TES_148: isi tandon manual berjalan
+         (currentState==MENU_WATER_LEVEL && (wlIsiAktif || solenoidTerbuka)) ||   // TES_148: isi tandon manual berjalan
+         pantauAkhirAktif;   // v1.3: pantau akhir berjalan
 }
 // Menu dibiarkan > 5 mnt tanpa tombol -> layar tunggu dosing (jadwal aktif) atau Status Dosing (jadwal tak aktif)
 void cekMenuMenganggur(){
@@ -3315,6 +3502,7 @@ void prosesIsiTandon() {
     tutupSolenoid();
     mulaiBuzzer(BUZZER_DURASI_MS); // volume pengisian tandon tercapai -> buzzer 10 detik
     dosingMulaiMs = millis();      // mulai hitung durasi siklus dosing
+    sdCatat(F("Tandon penuh"));    // v1.1
     dosingJedaIsiDetikBerjalan = 0;
     currentState = DOSING_JEDA_ISI; // jeda stabilisasi (5 dtk; ada air baru -> Jeda Homogenisasi 1) sebelum fase cek
     if((!statusOverlayAktif && !cancelConfirmAktif)){ lcd.clear(); tampilkanDosingJedaIsi(); }
@@ -3449,13 +3637,14 @@ void prosesCekPPM() {
             if(errorPPM > (float)PI_TOL_PPM) piFlagSiklus |= PI_FLAG_AB_ITERASI;
           } else {
             if(dosingMode==3) hitungKonstantaPIOtomatis();          // Auto-Tune: Kp/Ki dari persamaan & debit aktif
-            PIController piPPMAktif = (dosingMode==4) ? piPPM_ZN : piPPM;   // salinan: batas aman tak menimpa nilai tersimpan
-            if(dosingMode==4) batasiKpZNDenganGainModel(piPPMAktif, 0);
+            PIController piPPMAktif = (dosingMode==4) ? piPPM_ZN : piPPM;   // salinan: koreksi tak menimpa nilai tersimpan
+            if(dosingMode==4) terapkanKpKiZNDosing(piPPMAktif, 0);           // v1.2: ZN versi B
             // Batas pulsa: waktu model utk menutup seluruh error (nominal per sisi), maks. batas aman P2/P3
             float gP = gainModelPPM();
             float uMaks = (gP>0.0f) ? (errorPPM/gP) : (float)PUMP_MAKS_DETIK[4];
             if(uMaks > (float)PUMP_MAKS_DETIK[4]) uMaks = (float)PUMP_MAKS_DETIK[4];
-            piPulsaDetikAB = piHitungPulsa(errorPPM, piPPMAktif, uMaks);
+            piPulsaDetikAB = piHitungPulsa(errorPPM, piPPMAktif, uMaks, (dosingMode==4) ? dtCuplikZN(0,false) : 0.0f);
+            sdCatatPI(0, errorPPM, piPPMAktif.kp, piPPMAktif.ki, piPPMAktif.integral, piPulsaDetikAB);   // v1.1
             if(dosingMode==4) piPPM_ZN.integral = piPPMAktif.integral; else piPPM.integral = piPPMAktif.integral;
             if(piPulsaDetikAB <= 0.0f) piPPMSelesai = true;   // sisa error < resolusi 1 dtk pompa -> selesai tanpa pulsa
             else {
@@ -3626,7 +3815,7 @@ void prosesCekPH() {
               piPHAktif.ki = fasaAtas ? piPHKiAtas_ZN : piPHKiBawah_ZN;
               float fz = faktorSkalaVolZN(false) * faktorSkalaPPMZNPada(fasaAtas ? 1 : 2, false, ppmAcuanPI);   // TES_148: skala ke PPM TERUKUR
               piPHAktif.kp *= fz; piPHAktif.ki *= fz;
-              batasAmanKpKiZN(piPHAktif.kp, piPHAktif.ki, gEf);   // batas aman ZN ikut rentang pH & PPM
+              koreksiCuplikZN(piPHAktif.kp, piPHAktif.ki, fasaAtas ? 1 : 2, false);   // v1.2: ZN versi B (tanpa pemotongan)
             } else {
               // CL Auto-Tune: Kp = 0.5/g_ef, Ki = 0.1·Kp (dihitung ulang tiap iterasi; piPH.kp TIDAK ditimpa -> EEPROM tenang)
               piPHAktif.kp = (gEf>0.0f) ? (PI_FRAKSI_KOREKSI/gEf) : 0.0f;
@@ -3634,7 +3823,8 @@ void prosesCekPH() {
             }
             float uMaks = (tModel>0.0f) ? tModel : (float)PUMP_MAKS_DETIK[3];
             if(uMaks > (float)PUMP_MAKS_DETIK[3]) uMaks = (float)PUMP_MAKS_DETIK[3];
-            piPulsaDetikPH = piHitungPulsa(errorPH, piPHAktif, uMaks);
+            piPulsaDetikPH = piHitungPulsa(errorPH, piPHAktif, uMaks, (dosingMode==4) ? dtCuplikZN(1,false) : 0.0f);
+            sdCatatPI(1, errorPH, piPHAktif.kp, piPHAktif.ki, piPHAktif.integral, piPulsaDetikPH);   // v1.1
             piPH.integral = piPHAktif.integral;   // simpan balik integral yg sudah bertambah
             if(piPulsaDetikPH <= 0.0f) piPHSelesai = true;    // sisa error < resolusi 1 dtk pompa -> selesai tanpa pulsa
             else {
@@ -3980,20 +4170,20 @@ void prosesCekAkhir() {
 // ============================================================
 // Output PI = detik pulsa pompa peristaltik. Integral HANYA diakumulasi bila
 // output tidak sedang jenuh (ter-clamp) -> mencegah integral windup.
-// Batas aman Kp ZN SAAT BERJALAN: gain model berubah bila PPM target / volume / debit berubah setelah uji reaksi
-// (mis. slope pH turun ~3x antara 200 dan 2000 PPM) -> Kp lama bisa melewati batas anti-overshoot.
+// v1.2: Kp/Ki ZN saat dosing (Parameter Aktif): skala volume/PPM uji -> Parameter, lalu koreksi pencuplikan.
 // kanal: 0 = PPM, 1 = pH fase atas, 2 = pH fase bawah (pemetaan sama dgn Uji Reaksi).
-float kpMaksModel(int kanal, bool baru){   // batas aman Kp (anti overshoot) = FRAKSI_AMAN_ZN / gain model; 0 bila gain tak valid
-  float g = hitungGainModel(kanal, baru);
-  return (g>0.0f) ? (FRAKSI_AMAN_ZN/g) : 0.0f;
-}
-void batasiKpZNDenganGainModel(PIController &pi, int kanal){   // proses dosing selalu memakai Parameter Aktif
+void terapkanKpKiZNDosing(PIController &pi, int kanal){
   float f = faktorSkalaZN(kanal, false); pi.kp *= f; pi.ki *= f;   // TES_141: skala acuan uji -> Parameter Aktif
-  batasAmanKpKiZN(pi.kp, pi.ki, hitungGainModel(kanal, false));
+  koreksiCuplikZN(pi.kp, pi.ki, kanal, false);
 }
 // uMaks = batas pulsa iterasi ini (detik) = waktu model utk menutup SELURUH error, dibatasi batas aman pompa.
 // Melewati uMaks berarti PI meminta dosis lebih besar dari yang menurut persamaan dibutuhkan -> pasti overshoot.
-float piHitungPulsa(float error, PIController &pi, float uMaks){
+// v1.2: dtI > 0 (PI ZN) -> integral = jumlah e.dt TERMASUK galat sekarang (u_k = Kp.e_k + Ki.sum(e_j.dt), materi PID);
+//       dtI = 0 (CL Auto-Tune) -> integral = jumlah galat iterasi sebelumnya (desain diskret per iterasi, seperti v1.0).
+//       uMaks tetap dipasang sbg pengaman cadangan; piPulsaJenuh = true bila pulsa terpotong uMaks (dicatat di CSV).
+bool piPulsaJenuh = false;
+float piHitungPulsa(float error, PIController &pi, float uMaks, float dtI){
+  piPulsaJenuh = false;
   if(error <= 0.0f) return 0.0f;            // aktuator satu arah: hanya bisa menambah
   // TES_130: kanal dianggap SELESAI bila menurut MODEL sisa error < kenaikan 1 dtk pompa (uMaks = waktu model utk
   // menutup seluruh error < 1 dtk) -> pulsa minimum 1 dtk tak dipaksa (cegah overshoot, aktuator satu arah).
@@ -4001,10 +4191,12 @@ float piHitungPulsa(float error, PIController &pi, float uMaks){
   // kanal berhenti padahal error masih beberapa kali kenaikan 1 dtk (bisa di luar batasan) & integral tak sempat
   // bekerja. Kini Kp ZN kecil tetap memberi pulsa minimum 1 dtk selama model butuh >= 1 dtk.
   if(uMaks < 2.0f*PI_DEADBAND_DETIK) return 0.0f;
-  float uTanpaBatas = pi.kp*error + pi.ki*pi.integral;
+  float integralCalon = (dtI > 0.0f) ? (pi.integral + error*dtI) : pi.integral;
+  float uTanpaBatas = pi.kp*error + pi.ki*integralCalon;
   if(!(uTanpaBatas > 0.0f)) return 0.0f;   // TES_144: Kp = Ki = 0 (kanal ZN kosong) / NaN -> selesai tanpa dosis (dulu dipaksa 1 dtk)
   float u = constrain(uTanpaBatas, 0.0f, uMaks);
-  if(u == uTanpaBatas) pi.integral += error;   // tidak jenuh -> integral boleh bertambah
+  if(u == uTanpaBatas) pi.integral = (dtI > 0.0f) ? integralCalon : (pi.integral + error);   // tidak jenuh -> integral boleh bertambah
+  else piPulsaJenuh = true;                    // anti-windup: integral ditahan
   if(u < (float)PI_PULSA_MIN_DETIK) u = (float)PI_PULSA_MIN_DETIK; // pulsa minimum pompa (<= uMaks krn uMaks >= 1 dtk)
   // TES_138: pompa ber-resolusi 1 dtk -> dibulatkan DI SINI & tak boleh melewati uMaks (dulu round() di pemanggil:
   // 1,54 dtk -> 2 dtk = melewati waktu model utk seluruh error -> overshoot pada tandon kecil / gain besar).
@@ -4780,6 +4972,29 @@ static_assert(sizeof(KonfigZNUji) <= 32, "KonfigZNUji melewati blok rekaman ZN")
 static_assert(EEPROM_ALAMAT_ZNREK + ZNREK_UKURAN <= E2END + 1, "Blok rekaman ZN melewati ukuran EEPROM");
 #endif
 #endif
+// ── v1.3: setelan Uji Kinerja (blok 8 byte sesudah rekaman ZN; struct utama & EEPROM_VERSI tidak berubah) ──
+#define KONFIG_UJIKIN_MAGIC  0x2213u
+#define EEPROM_ALAMAT_UJIKIN (EEPROM_ALAMAT_ZNREK + ZNREK_UKURAN)
+struct KonfigUjiKinerja { uint16_t magic; uint8_t aktif, interval, bilas, akhir, cad1, cad2; };
+#ifdef __AVR__
+#ifdef E2END
+static_assert(EEPROM_ALAMAT_UJIKIN + sizeof(KonfigUjiKinerja) <= E2END + 1, "Blok Uji Kinerja melewati ukuran EEPROM");
+#endif
+#endif
+void eepromMuatUjiKinerja(){
+  KonfigUjiKinerja u; EEPROM.get(EEPROM_ALAMAT_UJIKIN, u);
+  if(u.magic != KONFIG_UJIKIN_MAGIC) return;   // belum pernah disimpan / sesudah Reset Sistem -> nilai bawaan
+  ujiPantauAktif = (u.aktif == 1);
+  if(u.interval >= UJI_INTERVAL_MIN && u.interval <= UJI_INTERVAL_MAKS) ujiIntervalMenit = u.interval;
+  if(u.bilas >= UJI_BILAS_MIN && u.bilas <= UJI_BILAS_MAKS) ujiKinBilasDetik = u.bilas;
+  if(u.akhir <= UJI_AKHIR_MAKS) ujiAkhirMenit = u.akhir;
+}
+void eepromSimpanUjiKinerja(){
+  KonfigUjiKinerja u; memset(&u, 0, sizeof(u));
+  u.magic = KONFIG_UJIKIN_MAGIC; u.aktif = ujiPantauAktif ? 1 : 0;
+  u.interval = ujiIntervalMenit; u.bilas = ujiKinBilasDetik; u.akhir = ujiAkhirMenit;
+  EEPROM.put(EEPROM_ALAMAT_UJIKIN, u);   // put() hanya menulis byte yang berubah
+}
 void eepromMuatZNRek(){
   for(int k=0;k<3;k++) znRekN[k] = 0;
   uint16_t m; EEPROM.get(EEPROM_ALAMAT_ZNREK, m);
@@ -4818,6 +5033,7 @@ void eepromSimpanZNRek(int k){
 void eepromMuat(){
   eepromMuatRekamCek();
   eepromMuatEkstra();
+  eepromMuatUjiKinerja();   // v1.3
   EEPROM.get(EEPROM_ALAMAT, g_eepromScratch);
   if(g_eepromScratch.magic != EEPROM_MAGIC || g_eepromScratch.versi != EEPROM_VERSI){
     eepromBaruDibuat = true;
@@ -4964,6 +5180,8 @@ void setup() {
   if(adsSiap) ads.setGain(GAIN_TWOTHIRDS);   // ±6,144 V: aman utk output modul sensor 0-5 V
   muatUlangKonstantaAktif();   // default tabel AB Mix & pH Down dulu
   eepromMuat();                // lalu timpa dgn parameter/kalibrasi/waktu tersimpan (jika ada)
+  FsDateTime::setCallback(sdWaktuFile);   // v1.1: tanggal file CSV dari RTC
+  sdMulai();                              // v1.1: deteksi kartu microSD (boleh tidak ada)
   // RTC kehilangan daya (baterai habis / modul baru): TIDAK lagi disetel diam-diam ke waktu lama/compile.
   // Waktu dianggap tidak valid (jadwal ditahan + alarm) sampai user mengisi ulang Waktu RTC.
   if(rtcSiap){
@@ -4990,7 +5208,7 @@ void setup() {
   bacaSemua();
   lcd.clear();
   lcd.setCursor(3,0); lcd.print(F("SISTEM DOSING"));
-  lcd.setCursor(3,1); lcd.print(F("HIDROPONIK v1.0"));
+  lcd.setCursor(3,1); lcd.print(F("HIDROPONIK v1.3"));
   delay(3000);
   lcd.clear();
   // Info penyebab restart & kondisi RTC
@@ -5192,6 +5410,9 @@ bool isiNilaiAwalInput(MenuState s, MenuState asal){
     } break;
     case MENU_PERSEN_MAKRO:   return inputBuffer.length()>0;   // sudah diisi saat memilih jenis dosing
     case UJI_ZN_INPUT_DURASI: return inputBuffer.length()>0;   // sudah diisi lama rekam terakhir
+    case UJI_KIN_INPUT_INTERVAL: itoa(ujiIntervalMenit, b, 10); break;   // v1.3
+    case UJI_KIN_INPUT_BILAS:    itoa(ujiKinBilasDetik, b, 10);    break;
+    case UJI_KIN_INPUT_AKHIR:    itoa(ujiAkhirMenit, b, 10);    break;
     case UJI_ZN_INPUT_VOLUME: { int v = (ujiVolumeL>0) ? ujiVolumeL : (baru ? terpilihVolumeBaru : terpilihVolume);   // TES_141
                                 if(v>=UJI_VOL_MIN && v<=UJI_VOL_MAKS) itoa(v,b,10); } break;
     case MENU_EC_BEBAS: {
@@ -5213,10 +5434,10 @@ bool isiNilaiAwalInput(MenuState s, MenuState asal){
     case MENU_SET_RTC_TGL:   if(rtcInput[2]>=1 && rtcInput[2]<=31) snprintf_P(b,sizeof(b),PSTR("%02d"),rtcInput[2]); break;
     case MENU_EDIT_KPKI_ZN: {
       if(znEditTahap!=0) return false;
-      // TES_141: isi awal = nilai EFEKTIF utk Parameter konteks (sudah diskalakan dari tandon uji & dibatasi) =
+      // v1.2: isi awal = nilai RUMUS ZN yang diskalakan ke Parameter konteks (belum dikoreksi pencuplikan) =
       // satuan yang sama dgn nilai yg diketik (edit manual berlaku utk volume & PPM target Parameter konteks)
       const ProfilKpKiZN &pz = profilZNKonteks(baru);
-      float kp, ki; kpKiZNEfektif(halKpKiZN, baru, kp, ki);
+      float kp = faktorSkalaZN(halKpKiZN, baru) * ((halKpKiZN==0) ? pz.kpPPM : (halKpKiZN==1 ? pz.kpPHAtas : pz.kpPHBawah));
       if(pz.terisi && kp>0.0f) fmtIsiKp(b, kp);
     } break;
     default: return false;
@@ -5239,9 +5460,705 @@ void isiAwalLangsung(const char* teks){
   inputBuffer = teks; inputIsiAwal = (inputBuffer.length()>0);
 }
 
+
+// ============================================================================
+// v1.1 — KARTU microSD: PENCATATAN SIKLUS DOSING (CSV) & MENU RIWAYAT DOSING
+// ============================================================================
+// Satu file per siklus cek: /RIWAYAT/<Jenis>_<jj.mm>_<tt-bb-th>.csv, mis. Auto_13.40_22-10-26.csv
+// ('/' tak boleh dipakai di nama file, sehingga tanggal memakai '-'; di LCD ditampilkan Auto_13.40_22/10/26).
+// Isi: kepala (parameter siklus) -> 1 baris per detik (waktu, tahap, PPM, pH, suhu, status ON/OFF D1-D3, P1-P3,
+// katup, daya TDS, volume kumulatif AB & pH Down) + baris catatan (tandon penuh, median cek, mulai pompa,
+// nilai PI tiap iterasi) -> ringkasan. File disinkronkan tiap detik: daya padam hanya kehilangan <= 1 detik data.
+// Kartu tidak ada / tercabut -> pencatatan berhenti diam-diam, proses dosing tidak terganggu.
+
+void sdWaktuFile(uint16_t* date, uint16_t* time, uint8_t* ms10){
+  DateTime n = rtcWaktuValid() ? rtc.now() : DateTime(2000,1,1,0,0,0);
+  *date = FS_DATE(n.year(), n.month(), n.day());
+  *time = FS_TIME(n.hour(), n.minute(), n.second());
+  *ms10 = 0;
+}
+
+// Periksa kartu (dipanggil saat boot, awal siklus & saat membuka Riwayat Dosing)
+bool sdMulai(){
+  if(sdLogAktif) return sdAda;                 // file siklus terbuka -> kartu sedang dipakai
+  sdAda = sd.begin(SdSpiConfig(PIN_SD_CS, SHARED_SPI, SD_SCK_MHZ(SD_SPI_MHZ)));
+  if(sdAda && !sd.exists(SD_FOLDER)) sdAda = sd.mkdir(SD_FOLDER);
+  return sdAda;
+}
+
+// Angka desimal untuk CSV (koma bila CSV_DESIMAL_KOMA)
+char* csvF(char* b, float v, byte dec){
+  dtostrf(v, 1, dec, b);
+#if CSV_DESIMAL_KOMA
+  for(char* p=b; *p; p++) if(*p=='.') *p=',';
+#endif
+  return b;
+}
+void sdSep(){ sdLog.write((uint8_t)CSV_SEP); }
+void sdEOL(){ sdLog.print(F("\r\n")); }
+void sdKolS(const char* t){ sdLog.print(t); sdSep(); }
+void sdKolF(const __FlashStringHelper* t){ sdLog.print(t); sdSep(); }
+void sdKolL(long v){ sdLog.print(v); sdSep(); }
+void sdKolX(float v, byte dec){ char b[16]; sdLog.print(csvF(b, v, dec)); sdSep(); }
+byte relayNyala(int pin){ bool hi = (digitalRead(pin)==HIGH); return (RELAY_AKTIF_LOW ? !hi : hi) ? 1 : 0; }
+
+// Gagal tulis (kartu tercabut / penuh) -> hentikan pencatatan siklus ini
+void sdCekGagal(){
+  if(sdLog.getWriteError() || !sdLog.sync()){
+    sdLog.close();
+    sdLogAktif = false; sdAda = false;
+  }
+}
+
+// Kolom awal setiap baris: Waktu; Detik; Tahap
+void sdKolomWaktu(){
+  char b[10];
+  if(rtcWaktuValid()){ DateTime n = rtc.now(); snprintf_P(b,sizeof(b),PSTR("%02d:%02d:%02d"),n.hour(),n.minute(),n.second()); }
+  else strcpy_P(b, PSTR("--:--:--"));
+  sdKolS(b);
+  sdKolL((long)((millis() - sdLogMulaiMs)/1000UL));
+  sdKolF(labelFaseDosing());
+}
+
+// Baris catatan kejadian: kolom data kosong, teks di kolom Catatan
+void sdCatatAwal(){
+  sdKolomWaktu();
+  for(byte i=0;i<13;i++) sdSep();              // PPM .. pH Down (mL) kosong
+}
+void sdCatat(const __FlashStringHelper* t){
+  if(!sdLogAktif) return;
+  sdCatatAwal(); sdLog.print(t); sdEOL(); sdCekGagal();
+}
+void sdCatatTeks(const char* t){
+  if(!sdLogAktif) return;
+  sdCatatAwal(); sdLog.print(t); sdEOL(); sdCekGagal();
+}
+// Nilai PI tiap iterasi: galat, Kp, Ki, integral I (sesudah iterasi ini; ZN: jumlah e.dt), lama pulsa
+void sdCatatPI(byte kanal, float e, float kp, float ki, float integral, float u){
+  if(!sdLogAktif) return;
+  sdCekKunciMedian();   // v1.2: median cek ini dicatat lebih dulu daripada perhitungan PI-nya
+  if(!sdLogAktif) return;
+  char a[14], b[14], c[14], d[14], f[10];
+  sdCatatAwal();
+  sdLog.print(kanal==0 ? F("PI AB: e=") : F("PI pH: e="));
+  sdLog.print(csvF(a, e, kanal==0 ? 0 : 2));
+  sdLog.print(F(" Kp="));  sdLog.print(csvF(b, kp, 4));
+  sdLog.print(F(" Ki="));  sdLog.print(csvF(c, ki, 5));
+  sdLog.print(F(" I="));   sdLog.print(csvF(d, integral, kanal==0 ? 0 : 2));
+  sdLog.print(F(" u="));   sdLog.print(csvF(f, u, 0)); sdLog.print(F(" dtk"));
+  if(piPulsaJenuh) sdLog.print(F(" (batas pulsa aktif)"));   // v1.2: pengaman cadangan bekerja
+  sdEOL(); sdCekGagal();
+}
+
+// Tambah nama file ke indeks (urutan waktu). Indeks hilang -> dibangun ulang dari isi folder.
+bool sdBangunIndeks();
+void sdTulisRekamIndeks(File32 &f, const char* nama){
+  char r[SD_REKAM_INDEKS];
+  memset(r, ' ', SD_REKAM_INDEKS);
+  size_t L = strlen(nama); if(L > SD_REKAM_INDEKS-2) L = SD_REKAM_INDEKS-2;
+  memcpy(r, nama, L);
+  r[SD_REKAM_INDEKS-2] = '\r'; r[SD_REKAM_INDEKS-1] = '\n';
+  f.write(r, SD_REKAM_INDEKS);
+}
+void sdTambahIndeks(const char* nama){
+  if(!sd.exists(SD_INDEKS)){ sdBangunIndeks(); return; }   // file baru sudah ada di folder -> ikut terdaftar
+  File32 f;
+  if(!f.open(SD_INDEKS, O_WRONLY | O_APPEND)) return;
+  sdTulisRekamIndeks(f, nama);
+  f.close();
+}
+bool sdBangunIndeks(){
+  File32 dir, f, idx;
+  if(!dir.open(SD_FOLDER)) return false;
+  if(!idx.open(SD_INDEKS, O_WRONLY | O_CREAT | O_TRUNC)){ dir.close(); return false; }
+  char nm[SD_REKAM_INDEKS];
+  while(f.openNext(&dir, O_RDONLY)){
+    wdt_reset();
+    if(!f.isDir()){
+      size_t L = f.getName(nm, sizeof(nm));
+      if(L > 4 && L <= SD_REKAM_INDEKS-2 && strcasecmp_P(nm + L - 4, PSTR(".csv"))==0) sdTulisRekamIndeks(idx, nm);
+    }
+    f.close();
+  }
+  idx.close(); dir.close();
+  return true;
+}
+
+const __FlashStringHelper* namaJenisDosing(int m){
+  return (m==1) ? F("Open Loop") : (m==3) ? F("CL Auto-Tune") : F("CL PI ZN");
+}
+
+// Mulai catatan siklus: buat file, tulis kepala (parameter) & judul kolom
+void sdMulaiLog(){
+  if(sdLogAktif){ sdLog.close(); sdLogAktif = false; }
+  if(!sdMulai() || !rtcWaktuValid()) return;   // nama file memerlukan tanggal & jam RTC
+  DateTime n = rtc.now();
+  char nama[30], path[44];
+  PGM_P pre = (dosingMode==1) ? PSTR("OL") : (dosingMode==3) ? PSTR("Auto") : PSTR("ZN-PI");
+  char pr[6]; strcpy_P(pr, pre);
+  for(byte k=0; k<10; k++){   // nama sama (menit yang sama) -> akhiran b, c, ...
+    if(k==0) snprintf_P(nama,sizeof(nama),PSTR("%s_%02d.%02d_%02d-%02d-%02d.csv"),pr,n.hour(),n.minute(),n.day(),n.month(),n.year()%100);
+    else     snprintf_P(nama,sizeof(nama),PSTR("%s_%02d.%02d_%02d-%02d-%02d%c.csv"),pr,n.hour(),n.minute(),n.day(),n.month(),n.year()%100,(char)('a'+k));
+    snprintf_P(path,sizeof(path),PSTR(SD_FOLDER "/%s"),nama);
+    if(!sd.exists(path)) break;
+    if(k==9) return;
+  }
+  if(!sdLog.open(path, O_WRONLY | O_CREAT | O_EXCL)){ sdAda = false; return; }
+  sdLogAktif = true; sdLogMulaiMs = millis();
+  sdStateTerakhir = -1; sdTerkunciPPM = dosingPPMTerkunci; sdTerkunciPH = dosingPHTerkunci;
+  sdDetikSepi = 0; sdPolaTerakhir = -1;
+  sdTambahIndeks(nama);
+  char b[16];
+  sdKolF(F("Sistem Dosing Hidroponik v1.3")); sdLog.print(F("Riwayat siklus dosing")); sdEOL();
+  sdKolF(F("Jenis dosing")); sdLog.print(namaJenisDosing(dosingMode)); sdEOL();
+  snprintf_P(b,sizeof(b),PSTR("%02d/%02d/%04d"),n.day(),n.month(),n.year());
+  sdKolF(F("Tanggal mulai")); sdLog.print(b); sdEOL();
+  snprintf_P(b,sizeof(b),PSTR("%02d:%02d:%02d"),n.hour(),n.minute(),n.second());
+  sdKolF(F("Jam mulai")); sdLog.print(b); sdEOL();
+  sdKolF(F("Volume tandon (L)")); sdLog.print(terpilihVolume); sdEOL();
+  sdKolF(F("Target PPM")); sdLog.print(terpilihPPM); sdEOL();
+  sdKolF(F("Target pH")); sdLog.print(csvF(b, terpilihPH, 2)); sdEOL();
+  sdKolF(F("Batasan PPM (+/-)")); sdLog.print(batasPPM); sdEOL();
+  sdKolF(F("Batasan pH (+/-)")); sdLog.print(csvF(b, batasPHx100/100.0f, 2)); sdEOL();
+  sdKolF(F("AB Mix pekatan")); sdLog.print(terpilihDilution); sdEOL();
+  sdKolF(F("AB Mix EC")); sdLog.print(csvF(b, terpilihEC.toFloat(), 2)); sdEOL();
+  sdKolF(F("Kemiringan AB (ppm per mL/L)")); sdLog.print(csvF(b, slopeABMixTerpilih, 2)); sdEOL();
+  sdKolF(F("pH Down")); sdKolS(terpilihAcid.c_str()); sdLog.print(terpilihConcPersen); sdLog.print(F(" %")); sdEOL();
+  sdKolF(F("Persen makro (%)")); sdLog.print(persenMakro); sdEOL();
+  for(byte i=1;i<TOTAL_PUMP_OPTIONS;i++){   // D1 = pompa sirkulasi sensor (tanpa debit dosing)
+    sdLog.print(F("Debit ")); sdLog.print(pumpNamaRingkas[i]); sdKolF(F(" (L/menit)"));
+    sdLog.print(csvF(b, terpilihDebitPump[i]/DEBIT_SKALA, 3)); sdEOL();
+  }
+  sdKolF(F("Lama bilas sensor (detik)")); sdLog.print(terpilihLamaCekSensor); sdEOL();
+  sdKolF(F("Jeda stabilisasi (detik)")); sdLog.print(terpilihJedaStabilisasi); sdEOL();
+  sdKolF(F("Jeda J0-J4 (menit)")); sdKolL(jedaJ0Menit());
+  for(byte i=0;i<4;i++){ sdLog.print(dosingJedaHomogenisasi[i]); if(i<3) sdSep(); }
+  sdEOL();
+  if(ujiPantauAktif){   // v1.3: setelan mode pantau Uji Kinerja
+    sdKolF(F("Mode pantau")); sdLog.print(F("ON")); sdEOL();
+    sdKolF(F("Interval pantau (detik)")); sdLog.print(pantauIntervalDetik()); sdEOL();
+    sdKolF(F("Bilas pantau (detik)")); sdLog.print(ujiKinBilasDetik); sdEOL();
+    sdKolF(F("Stabil pantau (detik)")); sdLog.print(pantauStabilDetik()); sdEOL();
+    sdKolF(F("Pantau akhir (menit)")); sdLog.print(ujiAkhirMenit); sdEOL();
+  }
+  if(dosingMode==4){   // v1.2: nilai rumus ZN, L, dt, dan nilai yang dipakai (koreksi pencuplikan) per kanal
+    const char* kanal[3] = {"ZN PPM", "ZN pH atas", "ZN pH bawah"};
+    sdLog.print(F("Kanal;Kp rumus ZN;Ki rumus ZN;L (detik);Delta t (detik);L' = L + Delta t/2;Kp dipakai;Ki dipakai")); sdEOL();
+    for(byte k=0;k<3;k++){
+      const ProfilKpKiZN &pz = profilZNKonteks(false);
+      float f  = faktorSkalaZN(k, false);
+      float kp = f * ((k==0) ? pz.kpPPM : (k==1 ? pz.kpPHAtas : pz.kpPHBawah));
+      float ki = f * ((k==0) ? pz.kiPPM : (k==1 ? pz.kiPHAtas : pz.kiPHBawah));
+      float L = waktuTundaZN(kp, ki), dt = dtCuplikZN(k, false);
+      float kpB, kiB; kpKiZNEfektif(k, false, kpB, kiB);
+      sdKolS(kanal[k]); sdKolX(kp, 4); sdKolX(ki, 6); sdKolX(L, 1); sdKolX(dt, 0); sdKolX(L + 0.5f*dt, 1);
+      sdKolX(kpB, 4); sdLog.print(csvF(b, kiB, 6)); sdEOL();
+    }
+  } else if(dosingMode==3){
+    sdKolF(F("Kp dan Ki Auto-Tune")); sdLog.print(F("dihitung tiap iterasi (lihat kolom Catatan)")); sdEOL();
+  }
+  sdEOL();
+  sdLog.print(F("Waktu;Detik;Tahap;PPM;pH;Suhu (C);D1;D2;D3;P1;P2;P3;Katup;TDS;AB per sisi (mL);pH Down (mL);Catatan"));
+  sdEOL();
+  sdCekGagal();
+}
+
+// Dipanggil tiap 1 detik dari loop()
+void sdLogTick(){
+  if(!sdLogAktif) return;
+  // catatan: tahap pompa baru dimulai (lama nyala target tiap pompa)
+  if((int)currentState != sdStateTerakhir){
+    sdStateTerakhir = (int)currentState;
+    MenuState st = currentState;
+    PGM_P lbl = NULL;
+    if(st==DOSING_MACRO_AB) lbl = PSTR("D2-D3 makro AB");
+    else if(st==DOSING_MICRO_AB) lbl = PSTR("P2-P3 mikro AB");
+    else if(st==DOSING_PI_POMPA_AB) lbl = PSTR("P2-P3 pulsa PI AB");
+    else if(st==DOSING_MACRO_PH) lbl = PSTR("P1 makro pH");
+    else if(st==DOSING_MICRO_PH) lbl = PSTR("P1 mikro pH");
+    else if(st==DOSING_PI_POMPA_PH) lbl = PSTR("P1 pulsa PI pH");
+    if(lbl){
+      char t[48], l[20]; strcpy_P(l, lbl);
+      if(dosingPumpRelayB>=0) snprintf_P(t,sizeof(t),PSTR("Mulai %s: %d dan %d dtk"), l, dosingPump1DetikTarget, dosingPump2DetikTarget);
+      else                    snprintf_P(t,sizeof(t),PSTR("Mulai %s: %d dtk"), l, dosingPump1DetikTarget);
+      sdCatatTeks(t);
+      if(!sdLogAktif) return;
+    }
+  }
+  // catatan: median cek baru terkunci
+  sdCekKunciMedian();
+  if(!sdLogAktif) return;
+  // baris data: tiap detik saat sensor dibaca / pompa menyala / status berubah;
+  // selain itu (pengisian tandon, jeda homogenisasi tanpa pembacaan) cukup tiap 10 detik
+  // v1.2: bacaan 5 dtk pertama sesudah relay TDS ON/OFF (fase stabilisasi daya) belum valid -> tidak dicatat
+  bool ppmAda = pantauFase ? (pantauFase==4 && tdsRelayAktif && tdsSensorValid)    // v1.3: hanya fase ukur pantau
+                           : (sensorTdsPerluAktif() && tdsRelayAktif && tdsSensorValid && cekSensorFase > 0);
+  bool phAda  = pantauFase ? (pantauFase==6 && phSensorValid)
+                           : (sensorPhPerluAktif() && phSensorValid && cekSensorFase > 0);
+  const uint8_t pinR[6] = {PIN_RELAY_D1, PIN_RELAY_D2, PIN_RELAY_D3, PIN_RELAY_P1, PIN_RELAY_P2, PIN_RELAY_P3};
+  byte pola = 0;
+  for(byte i=0;i<6;i++) if(relayNyala(pinR[i])) pola |= (1<<i);
+  byte polaLengkap = pola | (solenoidTerbuka ? 0x40 : 0) | (tdsRelayAktif ? 0x80 : 0);
+  if(!ppmAda && !phAda && pola==0 && polaLengkap==sdPolaTerakhir && ++sdDetikSepi < 10) return;
+  sdDetikSepi = 0; sdPolaTerakhir = polaLengkap;
+  sdKolomWaktu();
+  if(ppmAda) sdKolL(ppmTerbaca); else sdSep();
+  if(phAda)  sdKolX(phTerbaca, 2); else sdSep();
+  sdKolX(suhularutan, 1);
+  for(byte i=0;i<6;i++) sdKolL((pola>>i) & 1);
+  sdKolL(solenoidTerbuka ? 1 : 0); sdKolL(tdsRelayAktif ? 1 : 0);
+  sdKolX(dosingTotalABmL, 1); sdKolX(dosingTotalPHmL, 1);
+  sdEOL();
+  sdCekGagal();
+}
+
+// Ringkasan & tutup file (siklus selesai / gagal / dibatalkan)
+// v1.2: catatan median yang baru terkunci (dipanggil tiap detik dan sebelum file ditutup -> median cek akhir tercatat)
+void sdCekKunciMedian(){
+  if(dosingPPMTerkunci && !sdTerkunciPPM && statusPPMTerakhir >= 0){
+    char t[24]; snprintf_P(t,sizeof(t),PSTR("Median PPM = %d"), statusPPMTerakhir); sdCatatTeks(t);
+  }
+  sdTerkunciPPM = dosingPPMTerkunci;
+  if(dosingPHTerkunci && !sdTerkunciPH && statusPHTerakhir >= 0.0f){
+    char t[24], f[10]; snprintf_P(t,sizeof(t),PSTR("Median pH = %s"), csvF(f, statusPHTerakhir, 2)); sdCatatTeks(t);
+  }
+  sdTerkunciPH = dosingPHTerkunci;
+}
+// v1.3: nilai ringkasan diambil SAAT siklus selesai (sdSimpanRingkasan) lalu ditulis (sdTulisRingkasan) segera atau
+// sesudah pantau akhir. Baris RINGKASAN tetap baris terakhir file (dibaca menu Riwayat Dosing dari 160 byte terakhir).
+void sdSimpanRingkasan(bool adaDosis, uint8_t kode){
+  rkTunda.ada = false;
+  if(!sdLogAktif) return;
+  sdCekKunciMedian();
+  if(!sdLogAktif) return;
+  DateTime n = rtcWaktuValid() ? rtc.now() : DateTime(2000,1,1,0,0,0);
+  unsigned long t0 = ((long)(dosingMulaiMs - sdLogMulaiMs) >= 0) ? dosingMulaiMs : sdLogMulaiMs;   // durasi sama dgn rekap LCD
+  rkTunda.durasi = (long)((millis() - t0)/60000UL);
+  rkTunda.tgl = n.day(); rkTunda.bln = n.month(); rkTunda.thn = n.year(); rkTunda.jam = n.hour(); rkTunda.mnt = n.minute();
+  rkTunda.ppm = statusPPMTerakhir; rkTunda.ph = statusPHTerakhir;
+  rkTunda.ab = dosingTotalABmL; rkTunda.phml = dosingTotalPHmL;
+  rkTunda.tppm = terpilihPPM; rkTunda.tph = terpilihPH;
+  rkTunda.kode = kode; rkTunda.pf = piFlagSiklus & 0x0F; rkTunda.dosis = adaDosis ? 1 : 0;
+  rkTunda.ada = true;
+}
+void sdTulisRingkasan(){
+  if(!sdLogAktif || !rkTunda.ada){ rkTunda.ada = false; return; }
+  char b[24];
+  sdEOL();
+  sdLog.print(F("Ringkasan")); sdEOL();
+  snprintf_P(b,sizeof(b),PSTR("%02d/%02d/%04d %02d:%02d"),rkTunda.tgl,rkTunda.bln,rkTunda.thn,rkTunda.jam,rkTunda.mnt);
+  sdKolF(F("Selesai")); sdLog.print(b); sdEOL();
+  sdKolF(F("Durasi (menit)")); sdLog.print(rkTunda.durasi); sdEOL();
+  sdKolF(F("Status")); sdLog.print(teksStatusRiwayat(rkTunda.kode, rkTunda.dosis)); sdEOL();
+  if(rkTunda.pf){ sdKolF(F("Catatan PI")); sdLog.print(teksPIFlag(rkTunda.pf)); sdEOL(); }
+  sdKolF(F("PPM akhir")); sdLog.print(rkTunda.ppm); sdEOL();
+  sdKolF(F("pH akhir")); sdLog.print(csvF(b, rkTunda.ph, 2)); sdEOL();
+  sdKolF(F("AB Mix per sisi (mL)")); sdLog.print(csvF(b, rkTunda.ab, 1)); sdEOL();
+  sdKolF(F("pH Down (mL)")); sdLog.print(csvF(b, rkTunda.phml, 1)); sdEOL();
+  // baris mesin (dibaca menu Riwayat Dosing)
+  sdKolF(F("RINGKASAN"));
+  sdKolL(rkTunda.tgl); sdKolL(rkTunda.bln); sdKolL(rkTunda.thn); sdKolL(rkTunda.jam); sdKolL(rkTunda.mnt);
+  sdKolL(rkTunda.durasi); sdKolL(rkTunda.ppm); sdKolX(rkTunda.ph, 2);
+  sdKolX(rkTunda.ab, 1); sdKolX(rkTunda.phml, 1);
+  sdKolL(rkTunda.tppm); sdKolX(rkTunda.tph, 2);
+  sdKolL(rkTunda.kode); sdKolL(rkTunda.pf); sdLog.print(rkTunda.dosis); sdEOL();
+  sdLog.sync();
+  sdLog.close();
+  sdLogAktif = false;
+  rkTunda.ada = false;
+}
+void sdTutupLog(bool adaDosis, uint8_t kode){
+  sdSimpanRingkasan(adaDosis, kode);
+  sdTulisRingkasan();
+}
+
+const __FlashStringHelper* teksStatusRiwayat(uint8_t kode, bool adaDosis){
+  if(kode==CEK_ERR_TANDON) return F("Gagal: tandon");
+  if(kode==CEK_ERR_SENSOR) return F("Gagal: sensor");
+  if(kode==CEK_ERR_LAMBAT) return F("Respon dosis lambat");
+  if(kode==SD_KODE_BATAL)  return F("Dibatalkan");
+  return adaDosis ? F("Dosing selesai") : F("Cek selesai");
+}
+
+// ---- menu Riwayat Dosing ----
+int sdJumlahRiwayat(){
+  File32 f;
+  if(!f.open(SD_INDEKS, O_RDONLY)) return 0;
+  long j = (long)(f.fileSize() / SD_REKAM_INDEKS);
+  f.close();
+  return (j > 32000L) ? 32000 : (int)j;
+}
+// i = 0 -> file terbaru
+bool sdNamaRiwayat(int i, char* nama, byte n){
+  File32 f;
+  if(!f.open(SD_INDEKS, O_RDONLY)) return false;
+  long j = (long)(f.fileSize() / SD_REKAM_INDEKS);
+  if(i < 0 || i >= j){ f.close(); return false; }
+  f.seekSet((uint32_t)(j - 1 - i) * SD_REKAM_INDEKS);
+  char r[SD_REKAM_INDEKS];
+  int got = f.read(r, SD_REKAM_INDEKS);
+  f.close();
+  if(got < SD_REKAM_INDEKS-2) return false;
+  int L = SD_REKAM_INDEKS-2;
+  while(L > 0 && (r[L-1]==' ' || r[L-1]=='\r' || r[L-1]=='\n')) L--;
+  if(L >= n) L = n - 1;
+  memcpy(nama, r, L); nama[L] = 0;
+  return L > 0;
+}
+// "Auto_13.40_22-10-26.csv" -> "Auto_13.40_22/10/26" (maks 20 karakter LCD)
+void namaRiwayatTampil(const char* file, char* out){
+  byte L = 0;
+  while(file[L] && L < 30) L++;
+  if(L >= 4 && file[L-4]=='.') L -= 4;          // buang ".csv"
+  int us = -1;
+  for(byte i=0;i<L;i++) if(file[i]=='_') us = i;   // garis bawah terakhir = awal tanggal
+  byte k = 0;
+  for(byte i=0; i<L && k<20; i++){ char c = file[i]; if((int)i > us && us >= 0 && c=='-') c = '/'; out[k++] = c; }
+  out[k] = 0;
+}
+void bukaRiwayatDosing(){
+  riwayatSel = 0; riwayatScroll = 0;
+  sdMulai();
+  if(sdAda && !sd.exists(SD_INDEKS)) sdBangunIndeks();
+  riwayatJumlah = sdAda ? sdJumlahRiwayat() : 0;
+  currentState = MENU_RIWAYAT_LIST;
+  lcd.clear();
+  tampilkanRiwayatList();
+}
+void kursorRiwayatMati(){ if(riwayatKursor){ lcd.noBlink(); riwayatKursor = false; } }
+// Kursor berkedip hanya di daftar Riwayat Dosing; dimatikan bila layar lain / overlay tampil
+void jagaKursorRiwayat(){
+  if(riwayatKursor && (currentState!=MENU_RIWAYAT_LIST || lcdTertahan || promptTibaAktif || statusOverlayAktif || cancelConfirmAktif))
+    kursorRiwayatMati();
+}
+void tampilkanRiwayatList(){
+  char b[22];
+  if(!sdAda){
+    kursorRiwayatMati();
+    lcdPrintCenter(0, F("RIWAYAT DOSING"));
+    lcdPrint20(0,1, "");
+    lcdPrintCenter(2, F("SD Card Tidak Ada"));
+    lcdPrint20(0,3, "");
+    return;
+  }
+  if(riwayatJumlah <= 0){
+    kursorRiwayatMati();
+    lcdPrintCenter(0, F("RIWAYAT DOSING"));
+    lcdPrint20(0,1, "");
+    lcdPrintCenter(2, F("Belum ada riwayat"));
+    lcdPrint20(0,3, "");
+    return;
+  }
+  if(riwayatJumlah < 100) snprintf_P(b,sizeof(b),PSTR("RIWAYAT DOSING %d/%d"), riwayatSel+1, riwayatJumlah);
+  else                    snprintf_P(b,sizeof(b),PSTR("RIWAYAT %d/%d"), riwayatSel+1, riwayatJumlah);
+  lcdPrintCenter(0, b);
+  for(byte r=0;r<3;r++){
+    int i = riwayatScroll + r;
+    char nm[SD_REKAM_INDEKS];
+    if(i < riwayatJumlah && sdNamaRiwayat(i, nm, sizeof(nm))){ namaRiwayatTampil(nm, b); lcdPrint20(0, r+1, b); }
+    else lcdPrint20(0, r+1, "");
+  }
+  // baris terpilih ditandai kursor berkedip di kolom pertama (nama ZN-PI_.. memakai 20 kolom penuh)
+  if(!lcdTertahan){ lcd.setCursor(0, 1 + riwayatSel - riwayatScroll); lcd.blink(); riwayatKursor = true; }
+}
+// Baca baris RINGKASAN di akhir file
+void sdBacaRingkasan(const char* nama){
+  memset(&riwayatData, 0, sizeof(riwayatData));
+  char path[44]; snprintf_P(path,sizeof(path),PSTR(SD_FOLDER "/%s"), nama);
+  File32 f;
+  if(!f.open(path, O_RDONLY)) return;
+  riwayatData.fileAda = true;
+  uint32_t sz = f.fileSize();
+  char b[161];
+  f.seekSet(sz > 160 ? sz - 160 : 0);
+  int n = f.read(b, 160);
+  f.close();
+  if(n <= 0) return;
+  b[n] = 0;
+  char* p = strstr_P(b, PSTR("RINGKASAN"));
+  if(!p) return;
+  // pisah per kolom
+  float v[16]; byte k = 0;
+  char* q = p;
+  while(*q && *q!=CSV_SEP) q++;               // lewati kata RINGKASAN
+  while(*q==CSV_SEP && k < 16){
+    q++;
+    char t[16]; byte j = 0;
+    while(*q && *q!=CSV_SEP && *q!='\r' && *q!='\n' && j < 15){ t[j++] = (*q==',') ? '.' : *q; q++; }
+    t[j] = 0;
+    v[k++] = atof(t);
+  }
+  if(k < 15) return;
+  riwayatData.tgl = (uint8_t)v[0]; riwayatData.bln = (uint8_t)v[1]; riwayatData.thn = (uint16_t)v[2];
+  riwayatData.jam = (uint8_t)v[3]; riwayatData.mnt = (uint8_t)v[4];
+  riwayatData.durasi = (int)v[5]; riwayatData.ppm = (int)v[6]; riwayatData.ph = v[7];
+  riwayatData.ab = v[8]; riwayatData.phml = v[9]; riwayatData.tPPM = (int)v[10]; riwayatData.tPH = v[11];
+  riwayatData.kode = (uint8_t)v[12]; riwayatData.pf = (uint8_t)v[13]; riwayatData.dosis = (uint8_t)v[14];
+  riwayatData.ada = true;
+}
+void bukaDetailRiwayat(){
+  char nm[SD_REKAM_INDEKS];
+  if(!sdNamaRiwayat(riwayatSel, nm, sizeof(nm))) return;
+  namaRiwayatTampil(nm, riwayatNamaTampil);
+  sdBacaRingkasan(nm);
+  riwayatHal = 0;
+  kursorRiwayatMati();
+  currentState = MENU_RIWAYAT_DETAIL;
+  lcd.clear();
+  tampilkanRiwayatDetail();
+}
+// Halaman 1 = tata letak rekap "DOSING TERAKHIR", halaman 2 = tata letak Status Dosing (hasil & target)
+void tampilkanRiwayatDetail(){
+  char b[24], f[10], g[10];
+  if(riwayatHal == 0 || !riwayatData.ada){
+    lcdPrintCenter(0, riwayatNamaTampil);
+    if(!riwayatData.fileAda){
+      lcdPrintCenter(1, F("File tidak ada"));
+      lcdPrintCenter(2, F("(dihapus di laptop)"));
+      lcdPrint20(0,3, "");
+      return;
+    }
+    if(!riwayatData.ada){
+      lcdPrintCenter(1, F("Siklus tidak tuntas"));
+      lcdPrintCenter(2, F("(daya padam/reset)"));
+      lcdPrint20(0,3, "");
+      return;
+    }
+    snprintf_P(b,sizeof(b),PSTR("%02d:%02d %02d/%02d/%04d"),riwayatData.jam,riwayatData.mnt,riwayatData.tgl,riwayatData.bln,riwayatData.thn);
+    lcdPrintCenter(1, b);
+    snprintf_P(b,sizeof(b),PSTR("WAKTU: %d MENIT"), riwayatData.durasi);
+    lcdPrintCenter(2, b);
+    { char kiri[12], kanan[12];
+      fmtVolRingkas(kiri,sizeof(kiri),"AB",riwayatData.ab);
+      fmtVolRingkas(kanan,sizeof(kanan),"pH",riwayatData.phml);
+      lcdPrintLR(3, kiri, kanan); }
+    return;
+  }
+  if(riwayatData.ppm < 0) strcpy_P(f, PSTR("-")); else itoa(riwayatData.ppm, f, 10);
+  if(riwayatData.ph < 0.0f) strcpy_P(g, PSTR("-")); else fmtF(g, riwayatData.ph, 2);
+  snprintf_P(b,sizeof(b),PSTR("PPM : %s pH : %s"), f, g);
+  if(strlen(b) > 20) snprintf_P(b,sizeof(b),PSTR("PPM:%s pH:%s"), f, g);
+  lcdPrintCenter(0, b);
+  lcdCenterP(1, PSTR("Target %d | %s"), riwayatData.tPPM, fmtF(g, riwayatData.tPH, 2));
+  lcdPrintCenter(2, teksStatusRiwayat(riwayatData.kode, riwayatData.dosis));
+  if(riwayatData.pf) lcdPrintCenter(3, teksPIFlag(riwayatData.pf));
+  else               lcdPrint20(0,3, "");
+}
+
 // ==========
 // LOOP UTAMA
 // ==========
+// ============================================================================
+// v1.3 — UJI KINERJA: MODE PANTAU, PANTAU AKHIR, MULAI SIKLUS UJI
+// ============================================================================
+// Tujuan: rekaman PPM & pH yang rapat terhadap waktu (grafik respons seperti uji kendali standar) tanpa mengubah
+// algoritma dosing. Selama jeda homogenisasi, sampel pantau diambil tiap interval; sesudah siklus selesai,
+// pemantauan dapat dilanjutkan (PANTAU AKHIR) untuk melihat kestabilan & respons terhadap gangguan.
+int pantauStabilDetik(){ int st = terpilihJedaStabilisasi; if(st > 30) st = 30; if(st < 5) st = 5; return st; }
+int pantauDurasiDetik(){ return (int)ujiKinBilasDetik + pantauStabilDetik() + 2*JEDA_STABIL_SENSOR_DETIK + 2*PANTAU_N; }
+long pantauIntervalDetik(){
+  long iv = (long)ujiIntervalMenit * 60L, mn = (long)pantauDurasiDetik() + 10L;
+  return (iv > mn) ? iv : mn;   // interval < lama 1 sampel -> sampel berurutan tanpa celah
+}
+bool pantauStateSiklus(MenuState st){
+  return st==DOSING_HOMOGEN1 || st==DOSING_HOMOGEN2 || st==DOSING_HOMOGEN3 || st==DOSING_HOMOGEN4 ||
+         st==DOSING_PI_HOMOGEN_AB || st==DOSING_PI_HOMOGEN_PH || st==DOSING_JEDA_ISI;
+}
+// Sisa waktu tahap tunggu berjalan (detik). Sampel hanya dimulai bila selesai sebelum tahap berikutnya.
+long pantauSisaDetik(){
+  if(pantauAkhirAktif) return (long)ujiAkhirMenit*60L - pantauAkhirDetik;
+  if(currentState==DOSING_JEDA_ISI) return jedaIsiTargetDetik() - (long)dosingJedaIsiDetikBerjalan;
+  return (long)jedaUntukState(currentState)*60L - (long)dosingHomogenDetikBerjalan;
+}
+bool pantauLayak(){
+  if(!ujiPantauAktif) return false;
+  if(pantauAkhirAktif) return currentState==UJI_PANTAU_AKHIR || currentState==UJI_KIN_MULAI_KONF;
+  return sdLogAktif && pantauStateSiklus(currentState);   // tanpa kartu microSD: tidak ada yang direkam
+}
+// Hentikan sampel berjalan. Daya TDS tidak disentuh: jaring pengaman loop() mematikannya bila tak dipakai,
+// dan tahap cek berikutnya mungkin baru saja menyalakannya.
+void pantauBatal(){
+  if(pantauD1){ relayOff(PIN_RELAY_D1); pantauD1 = false; }
+  pantauFase = 0; pantauDetik = 0; pantauN = 0;
+}
+int medianIntPantau(int* a, byte n){
+  for(byte i=0; i+1<n; i++) for(byte j=i+1; j<n; j++) if(a[j]<a[i]){ int t=a[i]; a[i]=a[j]; a[j]=t; }
+  return a[n/2];
+}
+float medianFloatPantau(float* a, byte n){
+  for(byte i=0; i+1<n; i++) for(byte j=i+1; j<n; j++) if(a[j]<a[i]){ float t=a[i]; a[i]=a[j]; a[j]=t; }
+  return a[n/2];
+}
+// Baris hasil pantau di CSV: Tahap "Pantau: hasil", kolom PPM & pH = median, Catatan "Median pantau"
+void sdCatatPantau(){
+  if(!sdLogAktif) return;
+  sdKolomWaktu();
+  if(pantauPPMTerakhir >= 0) sdKolL(pantauPPMTerakhir); else sdSep();
+  if(pantauPHTerakhir >= 0.0f) sdKolX(pantauPHTerakhir, 2); else sdSep();
+  sdKolX(suhularutan, 1);
+  const uint8_t pinR[6] = {PIN_RELAY_D1, PIN_RELAY_D2, PIN_RELAY_D3, PIN_RELAY_P1, PIN_RELAY_P2, PIN_RELAY_P3};
+  for(byte i=0;i<6;i++) sdKolL(relayNyala(pinR[i]));
+  sdKolL(solenoidTerbuka ? 1 : 0); sdKolL(tdsRelayAktif ? 1 : 0);
+  sdKolX(dosingTotalABmL, 1); sdKolX(dosingTotalPHmL, 1);
+  sdLog.print(F("Median pantau")); sdEOL();
+  sdCekGagal();
+}
+// Dipanggil tiap 1 detik dari loop() sesudah updateDosingProses()
+void pantauTick(){
+  if(!pantauLayak()){ if(pantauFase) pantauBatal(); pantauLayakSebelum = false; return; }
+  if(!pantauLayakSebelum){   // tahap tunggu baru dimulai -> hitung mundur sampel pertama
+    pantauHitung = pantauAkhirAktif ? pantauIntervalDetik() : (long)PANTAU_JEDA_AWAL;
+    pantauLayakSebelum = true;
+  }
+  if(pantauFase == 0){
+    if(pantauHitung > 0) pantauHitung--;
+    if(pantauHitung <= 0 && pantauSisaDetik() >= (long)pantauDurasiDetik() + 5L){
+      relayOn(PIN_RELAY_D1); pantauD1 = true;          // FASE 1: bilas chamber dgn larutan tandon terbaru
+      pantauFase = 1; pantauDetik = 0; pantauN = 0;
+    }
+    return;
+  }
+  pantauDetik++;
+  switch(pantauFase){
+    case 1:   // bilas (D1 ON)
+      if(pantauDetik >= ujiKinBilasDetik){ relayOff(PIN_RELAY_D1); pantauD1 = false; pantauFase = 2; pantauDetik = 0; }
+      break;
+    case 2:   // stabil (D1 OFF, larutan diam)
+      if(pantauDetik >= pantauStabilDetik()){ nyalakanRelayTDS(); pantauFase = 3; pantauDetik = 0; }
+      break;
+    case 3:   // daya TDS baru ON: bacaan belum dipercaya
+      if(pantauDetik >= JEDA_STABIL_SENSOR_DETIK){ primingBufferSensorSelektif(true, false); pantauFase = 4; pantauDetik = 0; pantauN = 0; }
+      break;
+    case 4:   // ukur PPM (median 10 dtk)
+      if(tdsSensorValid && pantauN < PANTAU_N) pantauBufPPM[pantauN++] = ppmTerbaca;
+      if(pantauDetik >= PANTAU_N){
+        pantauPPMTerakhir = (pantauN > 0) ? medianIntPantau(pantauBufPPM, pantauN) : -1;
+        matikanRelayTDS();                                  // TDS OFF -> elektrode pH bebas interferensi
+        pantauFase = 5; pantauDetik = 0; pantauN = 0;
+      }
+      break;
+    case 5:   // daya TDS baru OFF
+      if(pantauDetik >= JEDA_STABIL_SENSOR_DETIK){ primingBufferSensorSelektif(false, true); pantauFase = 6; pantauDetik = 0; pantauN = 0; }
+      break;
+    case 6:   // ukur pH (median 10 dtk)
+      if(phSensorValid && pantauN < PANTAU_N) pantauBufPH[pantauN++] = phTerbaca;
+      if(pantauDetik >= PANTAU_N){
+        pantauPHTerakhir = (pantauN > 0) ? medianFloatPantau(pantauBufPH, pantauN) : -1.0f;
+        pantauFase = 7; sdCatatPantau();                    // label tahap "Pantau: hasil"
+        pantauFase = 0; pantauDetik = 0; pantauN = 0;
+        pantauHitung = pantauIntervalDetik() - (long)pantauDurasiDetik();
+      }
+      break;
+    default: pantauBatal(); break;
+  }
+}
+// Teks status pantau (maks 20 kolom). denganNilai: tampilkan hasil terakhir + hitung mundur saat diam.
+void teksFasePantau(char* b, size_t n, bool denganNilai){
+  switch(pantauFase){
+    case 1: snprintf_P(b,n,PSTR("Pantau: bilas %d/%d"), pantauDetik, (int)ujiKinBilasDetik); return;
+    case 2: snprintf_P(b,n,PSTR("Pantau: stabil %d/%d"), pantauDetik, pantauStabilDetik()); return;
+    case 3: strcpy_P(b, PSTR("Pantau: daya TDS")); return;
+    case 4: snprintf_P(b,n,PSTR("Pantau: PPM %d/%d"), pantauDetik, PANTAU_N); return;
+    case 5: strcpy_P(b, PSTR("Pantau: stabil pH")); return;
+    case 6: snprintf_P(b,n,PSTR("Pantau: pH %d/%d"), pantauDetik, PANTAU_N); return;
+    default: break;
+  }
+  long t = pantauLayakSebelum ? pantauHitung : (pantauAkhirAktif ? pantauIntervalDetik() : (long)PANTAU_JEDA_AWAL);
+  if(t < 0) t = 0;
+  bool adaBerikut = pantauLayak() && (pantauSisaDetik() - t >= (long)pantauDurasiDetik() + 5L);
+  char w[8];
+  if(adaBerikut) snprintf_P(w,sizeof(w),PSTR("%ld:%02ld"), t/60L, t%60L); else strcpy_P(w, PSTR("-"));
+  if(denganNilai && (pantauPPMTerakhir >= 0 || pantauPHTerakhir >= 0.0f)){
+    char p[8], h[8];
+    if(pantauPPMTerakhir >= 0) itoa(pantauPPMTerakhir, p, 10); else strcpy_P(p, PSTR("-"));
+    if(pantauPHTerakhir >= 0.0f) fmtF(h, pantauPHTerakhir, 2); else strcpy_P(h, PSTR("-"));
+    snprintf_P(b,n,PSTR("%s|%s lagi %s"), p, h, w);
+  } else snprintf_P(b,n,PSTR("Sampel lagi %s"), w);
+}
+bool pantauAkhirBoleh(){ return ujiPantauAktif && ujiAkhirMenit > 0 && sdLogAktif; }
+void tampilkanPantauAkhir(){
+  char b[21];
+  snprintf_P(b,sizeof(b),PSTR("PANTAU AKHIR %ld/%dm"), pantauAkhirDetik/60L, (int)ujiAkhirMenit);
+  lcdPrintCenter(0, b);
+  teksFasePantau(b, sizeof(b), false); lcdPrintCenter(1, b);
+  char p[8], h[8];
+  if(pantauPPMTerakhir >= 0) itoa(pantauPPMTerakhir, p, 10); else strcpy_P(p, PSTR("-"));
+  if(pantauPHTerakhir >= 0.0f) fmtF(h, pantauPHTerakhir, 2); else strcpy_P(h, PSTR("-"));
+  snprintf_P(b,sizeof(b),PSTR("PPM %s  pH %s"), p, h); lcdPrintCenter(2, b);
+  if(pantauStopTekan > 0) lcdPrintCenter(3, F("Tekan * lagi: stop"));
+  else                    lcdPrintCenter(3, F("B=Gangguan #=Siklus"));
+}
+void mulaiPantauAkhir(bool adaDosis){
+  pantauAkhirAktif = true; pantauAkhirDetik = 0; pantauAkhirAdaDosis = adaDosis; pantauStopTekan = 0;
+  pantauBatal(); pantauLayakSebelum = false;   // hitung mundur sampel dimulai ulang
+  char t[34]; snprintf_P(t,sizeof(t),PSTR("Pantau akhir mulai (%d menit)"), (int)ujiAkhirMenit); sdCatatTeks(t);
+  currentState = UJI_PANTAU_AKHIR;
+  lcd.clear(); tampilkanPantauAkhir();
+}
+// Akhiri pantau akhir: catat, tulis RINGKASAN (nilai saat siklus selesai), tutup file CSV.
+// lanjutSiklus = true bila langsung disusul siklus baru (Mulai Siklus Uji / jadwal tiba) -> tanpa layar rekap.
+void selesaiPantauAkhir(bool lanjutSiklus){
+  if(!pantauAkhirAktif) return;
+  pantauBatal();
+  matikanRelayTDS();
+  pantauAkhirAktif = false;
+  char t[36]; snprintf_P(t,sizeof(t),PSTR("Pantau akhir selesai (%ld menit)"), pantauAkhirDetik/60L); sdCatatTeks(t);
+  sdTulisRingkasan();
+  if(lanjutSiklus) return;
+  lcd.clear();
+  if(pantauAkhirAdaDosis){ currentState = DOSING_REKAP; rekapDetikBerjalan = 0; tampilkanRekapDosing(); }
+  else { currentState = DOSING_FINAL_STATUS; finalStatusDetikBerjalan = 0; tampilkanStatusDosing(); }
+}
+// Dipanggil tiap 1 detik selama pantau akhir aktif
+void prosesPantauAkhir(){
+  pantauAkhirDetik++;
+  if(pantauStopTekan > 0){ pantauStopTekan--; }
+  if(currentState != UJI_PANTAU_AKHIR) return;   // layar konfirmasi mulai siklus sedang terbuka
+  if(pantauAkhirDetik >= (long)ujiAkhirMenit*60L && pantauFase == 0){ selesaiPantauAkhir(false); return; }
+  tampilkanPantauAkhir();
+}
+// ---- layar menu Uji Kinerja ----
+void barisUjiKinerja(int idx, char* b, size_t n){
+  switch(idx){
+    case 0:  snprintf_P(b,n,PSTR("Mode Pantau: %s"), ujiPantauAktif ? "ON" : "OFF"); break;
+    case 1:  snprintf_P(b,n,PSTR("Interval: %d menit"), (int)ujiIntervalMenit); break;
+    case 2:  snprintf_P(b,n,PSTR("Bilas: %d detik"), (int)ujiKinBilasDetik); break;
+    case 3:  snprintf_P(b,n,PSTR("Pantau Akhir: %dm"), (int)ujiAkhirMenit); break;
+    default: strcpy_P(b, PSTR("Mulai Siklus Uji")); break;
+  }
+}
+void tampilkanMenuUjiKinerja(){
+  lcdPrintCenter(0, F("UJI KINERJA"));
+  for(int i=0;i<3;i++){
+    int idx = scrollUjiKinerja + i;
+    char b[19], r[21];
+    if(idx < 5){
+      barisUjiKinerja(idx, b, sizeof(b));
+      snprintf_P(r,sizeof(r),PSTR("%s%s"), idx==selUjiKinerja ? "> " : "  ", b);
+      lcdPrint20(0, i+1, r);
+    } else lcdPrint20(0, i+1, "");
+  }
+}
+void tampilkanUjiKinInput(){
+  char b[21];
+  int mn, mk;
+  if(currentState==UJI_KIN_INPUT_INTERVAL){ lcdPrintCenter(0, F("Interval pantau")); mn=UJI_INTERVAL_MIN; mk=UJI_INTERVAL_MAKS; }
+  else if(currentState==UJI_KIN_INPUT_BILAS){ lcdPrintCenter(0, F("Bilas pantau (D1)")); mn=UJI_BILAS_MIN; mk=UJI_BILAS_MAKS; }
+  else { lcdPrintCenter(0, F("Pantau akhir")); mn=0; mk=UJI_AKHIR_MAKS; }
+  bool detik = (currentState==UJI_KIN_INPUT_BILAS);
+  snprintf_P(b,sizeof(b), detik ? PSTR("(%d-%d detik):") : PSTR("(%d-%d menit):"), mn, mk); lcdPrintCenter(1, b);
+  lcdPrintCenter(2, (inputBuffer.length()>0 ? inputBuffer : String(F("_"))) + (detik ? F(" detik") : F(" menit")));
+  if(currentState==UJI_KIN_INPUT_INTERVAL){ snprintf_P(b,sizeof(b),PSTR("1 sampel = %d detik"), pantauDurasiDetik()); lcdPrintCenter(3, b); }
+  else if(currentState==UJI_KIN_INPUT_AKHIR) lcdPrintCenter(3, F("0 = tanpa pantau"));
+  else lcdPrintCenter(3, F("sebelum tiap sampel"));
+}
+void tampilkanUjiKinMulaiKonf(){
+  if(ujiKonfDariPantau){ lcdPrintCenter(0, F("AKHIRI PANTAU &")); lcdPrintCenter(1, F("MULAI SIKLUS BARU?")); }
+  else                 { lcdPrintCenter(0, F("MULAI SIKLUS UJI")); lcdPrintCenter(1, F("Dosing sekarang?")); }
+  lcdPrint20(0,2, String(selUjiMulai==0?"> ":"  ") + F("Ya"));
+  lcdPrint20(0,3, String(selUjiMulai==1?"> ":"  ") + F("Tidak"));
+}
+
 void loop() {
   wdt_reset();
   cekIsiAwalInput();
@@ -5298,6 +6215,10 @@ void loop() {
       tampilkanTesSolenoid();
     }
     updateDosingProses();
+    pantauTick();                   // v1.3: sampel pantau Uji Kinerja (jeda homogenisasi / pantau akhir)
+    if(pantauAkhirAktif) prosesPantauAkhir();
+    sdLogTick();                    // v1.1: 1 baris CSV per detik selama siklus berjalan
+    jagaKursorRiwayat();            // v1.1
     cekPemicuDosingLatarBelakang();
     cekMenuMenganggur();   // TES_135
     // Overlay "Cancel Dosing?" dibiarkan tanpa jawaban -> anggap "Tidak" (proses dosing tetap berjalan normal)
@@ -5382,6 +6303,7 @@ void loop() {
       if(selCancelDosing==0){
         // Ya, batalkan dosing: SEMUA aktuator langsung dimatikan
         matikanSemuaPompa();             // D1-D3, P1-P3
+        sdTutupLog(dosingSudahAdaDosis, SD_KODE_BATAL);   // v1.1
         tutupSolenoid();
         matikanRelayTDS();
         mulaiBuzzer(BUZZER_DURASI_MS);   // alarm: dosing dibatalkan manual
@@ -5545,11 +6467,103 @@ void loop() {
         selKunciKanal=0;
         currentState=MENU_KUNCI_KANAL;
         tampilkanMenuKunciKanal();
+      } else if(selPengaturanSistem==4){
+        bukaRiwayatDosing();          // v1.1
+      } else if(selPengaturanSistem==5){
+        selUjiKinerja=0; scrollUjiKinerja=0;   // v1.3
+        currentState=MENU_UJI_KINERJA;
+        tampilkanMenuUjiKinerja();
       } else {
         selResetSistemConfirm=1;
         currentState=RESET_SISTEM_CONFIRM;
         tampilkanResetSistemConfirm();
       }
+    }
+  }
+
+  // ── v1.1: RIWAYAT DOSING (kartu microSD) ──
+  else if(currentState==MENU_RIWAYAT_LIST){
+    if     (key=='A'){ if(riwayatJumlah>0){ naik(riwayatSel,riwayatScroll,riwayatJumlah); tampilkanRiwayatList(); } }
+    else if(key=='C'){ if(riwayatJumlah>0){ turun(riwayatSel,riwayatScroll,riwayatJumlah); tampilkanRiwayatList(); } }
+    else if(key=='B'){ if(sdAda && riwayatJumlah>0) bukaDetailRiwayat(); }
+    else if(key=='*'){ kursorRiwayatMati(); currentState=MENU_PENGATURAN_SISTEM; lcd.clear(); tampilkanMenuPengaturanSistem(); }
+  }
+  else if(currentState==MENU_RIWAYAT_DETAIL){
+    if     (key=='B'){ if(riwayatData.ada){ riwayatHal = riwayatHal ? 0 : 1; lcd.clear(); tampilkanRiwayatDetail(); } }
+    else if(key=='*'){ currentState=MENU_RIWAYAT_LIST; lcd.clear(); tampilkanRiwayatList(); }
+  }
+
+  // ── v1.3: UJI KINERJA ──
+  else if(currentState==MENU_UJI_KINERJA){
+    if     (key=='A'){ naik(selUjiKinerja,scrollUjiKinerja,5); tampilkanMenuUjiKinerja(); }
+    else if(key=='C'){ turun(selUjiKinerja,scrollUjiKinerja,5); tampilkanMenuUjiKinerja(); }
+    else if(key=='*'){ currentState=MENU_PENGATURAN_SISTEM; lcd.clear(); tampilkanMenuPengaturanSistem(); }
+    else if(key=='B'){
+      if(selUjiKinerja==0){ ujiPantauAktif = !ujiPantauAktif; eepromSimpanUjiKinerja(); tampilkanMenuUjiKinerja(); }
+      else if(selUjiKinerja==1){ inputBuffer=""; currentState=UJI_KIN_INPUT_INTERVAL; lcd.clear(); tampilkanUjiKinInput(); }
+      else if(selUjiKinerja==2){ inputBuffer=""; currentState=UJI_KIN_INPUT_BILAS;    lcd.clear(); tampilkanUjiKinInput(); }
+      else if(selUjiKinerja==3){ inputBuffer=""; currentState=UJI_KIN_INPUT_AKHIR;    lcd.clear(); tampilkanUjiKinInput(); }
+      else if(!dosingSedangMenunggu){   // Mulai Siklus Uji: jadwal (Parameter Aktif) harus sudah aktif
+        lcd.clear();
+        lcdPrintCenter(0, F("MULAI SIKLUS UJI"));
+        lcdPrintCenter(1, F("Jadwal belum aktif"));
+        lcdPrintCenter(2, F("Pilih Mulai Dosing"));
+        lcdPrintCenter(3, F("di Menu Utama dulu"));
+        jedaInfo(3000);
+        lcd.clear(); tampilkanMenuUjiKinerja();
+      } else {
+        selUjiMulai=1; ujiKonfDariPantau=false;
+        currentState=UJI_KIN_MULAI_KONF; lcd.clear(); tampilkanUjiKinMulaiKonf();
+      }
+    }
+  }
+  else if(currentState==UJI_KIN_INPUT_INTERVAL || currentState==UJI_KIN_INPUT_BILAS || currentState==UJI_KIN_INPUT_AKHIR){
+    if(key>='0'&&key<='9'){ if(inputBuffer.length()<3){ inputBuffer+=key; tampilkanUjiKinInput(); } }
+    else if(key=='D'){ inputBuffer=""; tampilkanUjiKinInput(); }
+    else if(key=='*'){ inputBuffer=""; currentState=MENU_UJI_KINERJA; lcd.clear(); tampilkanMenuUjiKinerja(); }
+    else if(key=='B'){
+      if(inputBuffer.length()==0) return;
+      int v = inputBuffer.toInt();
+      int mn = (currentState==UJI_KIN_INPUT_INTERVAL) ? UJI_INTERVAL_MIN  : (currentState==UJI_KIN_INPUT_BILAS) ? UJI_BILAS_MIN  : 0;
+      int mk = (currentState==UJI_KIN_INPUT_INTERVAL) ? UJI_INTERVAL_MAKS : (currentState==UJI_KIN_INPUT_BILAS) ? UJI_BILAS_MAKS : UJI_AKHIR_MAKS;
+      if(v<mn || v>mk){
+        char e[21]; snprintf_P(e,sizeof(e),PSTR("Batas: %d-%d"),mn,mk);
+        tampilkanError(e); inputBuffer=""; tampilkanUjiKinInput(); return;
+      }
+      if(currentState==UJI_KIN_INPUT_INTERVAL)   ujiIntervalMenit = (byte)v;
+      else if(currentState==UJI_KIN_INPUT_BILAS) ujiKinBilasDetik    = (byte)v;
+      else                                       ujiAkhirMenit    = (byte)v;
+      eepromSimpanUjiKinerja();
+      inputBuffer="";
+      konfirmasiSukses(F("Uji Kinerja OK!"), MENU_UJI_KINERJA);
+    }
+  }
+  else if(currentState==UJI_KIN_MULAI_KONF){
+    if     (key=='A'){ if(selUjiMulai>0){ selUjiMulai--; tampilkanUjiKinMulaiKonf(); } }
+    else if(key=='C'){ if(selUjiMulai<1){ selUjiMulai++; tampilkanUjiKinMulaiKonf(); } }
+    else if(key=='*' || (key=='B' && selUjiMulai==1)){
+      if(ujiKonfDariPantau && pantauAkhirAktif){ currentState=UJI_PANTAU_AKHIR; lcd.clear(); tampilkanPantauAkhir(); }
+      else { currentState=MENU_UJI_KINERJA; lcd.clear(); tampilkanMenuUjiKinerja(); }
+    }
+    else if(key=='B'){
+      if(ujiKonfDariPantau) selesaiPantauAkhir(true);   // RINGKASAN siklus sebelumnya ditulis, file ditutup
+      if(!dosingSedangMenunggu){ currentState=MENU_UTAMA; lcd.clear(); tampilkanMenuUtama(); return; }
+      siklusManualUji = true;
+      mulaiSiklusCekHarian();
+    }
+  }
+  else if(currentState==UJI_PANTAU_AKHIR){
+    if(key=='B'){   // tandai gangguan (mis. air baku ditambahkan) -> catatan di CSV
+      sdCatat(F("GANGGUAN ditandai"));
+      lcd.clear(); lcdPrintCenter(1, F("Gangguan dicatat"));
+      char b[21]; snprintf_P(b,sizeof(b),PSTR("menit ke-%ld"), pantauAkhirDetik/60L); lcdPrintCenter(2, b);
+      jedaInfo(1500);
+      lcd.clear(); tampilkanPantauAkhir();
+    }
+    else if(key=='#'){ selUjiMulai=1; ujiKonfDariPantau=true; currentState=UJI_KIN_MULAI_KONF; lcd.clear(); tampilkanUjiKinMulaiKonf(); }
+    else if(key=='*'){
+      if(pantauStopTekan>0) selesaiPantauAkhir(false);
+      else { pantauStopTekan=3; tampilkanPantauAkhir(); }
     }
   }
 
@@ -6238,7 +7252,7 @@ void loop() {
       // TES_128: tampilkan nilai yang benar-benar disimpan (dulu hanya "PPM/pH disimpan!")
       { char b[21], f[10];
         lcd.clear();
-        lcdPrintCenter(0, String(itemTerpilih.nama));
+        lcdPrintCenter(0, String((const __FlashStringHelper*)itemTerpilih.nama));
         snprintf_P(b,sizeof(b),PSTR("PPM %d | pH %s"), itemTerpilih.ppm, fmtF(f,itemTerpilih.ph,2));
         lcdPrintCenter(1, b);
         lcdPrintCenter(2, F("PPM/pH disimpan!"));
@@ -7333,7 +8347,7 @@ void tampilkanMenuUtama() {
     int idx=scrollMenuUtama+i;
     if(idx<TOTAL_MENU_UTAMA_ROWS){
       String line=(idx==selMenuUtama?"> ":"  ");
-      line+=menuUtamaOptions[idx];
+      line+=FPGM(menuUtamaOptions,idx);
       lcdPrint20(0,i+1,line);
     } else lcdPrint20(0,i+1,"");
   }
@@ -7353,7 +8367,7 @@ void tampilkanMenuKredit(){
     return;
   }
   lcdPrintCenter(0,F("Sistem Dosing"));
-  lcdPrintCenter(1,F("Hidroponik v1.0"));
+  lcdPrintCenter(1,F("Hidroponik v1.3"));
   lcdPrintCenter(2,F("dibuat oleh:"));
   lcdPrintCenter(3,F("Syahid_TMB IPB 59"));
 }
@@ -7365,7 +8379,7 @@ void tampilkanSubMenuA(){
   lcdPrintCenter(0,F("PARAMETER DOSING"));
   for(int i=0;i<3;i++){
     int idx=scrollMenuA+i;
-    if(idx<TOTAL_MENU_A_ROWS) lcdPrint20(0,i+1,(idx==selMenuA?"> ":"  ")+String(menuAOptions[idx]));
+    if(idx<TOTAL_MENU_A_ROWS) lcdPrint20(0,i+1,(idx==selMenuA?"> ":"  ")+String(FPGM(menuAOptions,idx)));
     else lcdPrint20(0,i+1,"");
   }
 }
@@ -7470,13 +8484,13 @@ void tampilkanMenuPPMPHTanaman(){
   lcdPrintCenter(0,F("PPM/pH TANAMAN"));
   for(int i=0;i<3;i++){
     int idx=scrollPPMPHTanaman+i;
-    if(idx<TOTAL_PPM_PH_TANAMAN_ROWS) lcdPrint20(0,i+1,(idx==selPPMPHTanaman?"> ":"  ")+String(ppmPhTanamanOptions[idx]));
+    if(idx<TOTAL_PPM_PH_TANAMAN_ROWS) lcdPrint20(0,i+1,(idx==selPPMPHTanaman?"> ":"  ")+String(FPGM(ppmPhTanamanOptions,idx)));
     else lcdPrint20(0,i+1,"");
   }
 }
 
 void tampilkanMenuTanamanList(){
-  lcdPrintCenter(0, String(tanamanKategoriJudul[selTanamanKategori]));
+  lcdPrintCenter(0, String(FPGM(tanamanKategoriJudul,selTanamanKategori)));
   int totalItem = kategoriTanamanTotal[selTanamanKategori];
   const TanamanData* dt = kategoriTanamanData[selTanamanKategori];
   for(int i=0;i<3;i++){
@@ -7484,7 +8498,7 @@ void tampilkanMenuTanamanList(){
     if(idx<totalItem){
       TanamanData itemBaris;
       memcpy_P(&itemBaris, &dt[idx], sizeof(TanamanData));
-      lcdPrint20(0,i+1,(idx==selTanamanItem?"> ":"  ")+String(itemBaris.nama));
+      lcdPrint20(0,i+1,(idx==selTanamanItem?"> ":"  ")+String((const __FlashStringHelper*)itemBaris.nama));
     }
     else lcdPrint20(0,i+1,"");
   }
@@ -7497,7 +8511,7 @@ void tampilkanSubMenuB(){
   lcdPrintCenter(0,F("MODE KALIBRASI"));
   for(int i=0;i<3;i++){
     int idx=scrollMenuB+i;
-    if(idx<TOTAL_MENU_B_ROWS) lcdPrint20(0,i+1,(idx==selMenuB?"> ":"  ")+String(menuBOptions[idx]));
+    if(idx<TOTAL_MENU_B_ROWS) lcdPrint20(0,i+1,(idx==selMenuB?"> ":"  ")+String(FPGM(menuBOptions,idx)));
     else lcdPrint20(0,i+1,"");
   }
 }
@@ -7768,7 +8782,7 @@ void tampilkanMenuPilihPompa(){
     int idx=scrollPump+i;
     if(idx<TOTAL_UJI_OPTIONS){
       String prefix = (idx==selPump) ? "> " : "  ";
-      lcdPrint20(0, i+1, prefix + String(ujiOptions[idx]));
+      lcdPrint20(0, i+1, prefix + String(FPGM(ujiOptions,idx)));
     } else {
       lcdPrint20(0, i+1, "");
     }
@@ -7902,14 +8916,32 @@ float faktorSkalaPPMZNPada(int kanal, bool baru, int tgt){   // kanal pH: gain p
   return (sRef>0.0f && sTgt>0.0f) ? sRef/sTgt : 1.0f;
 }
 float faktorSkalaZN(int kanal, bool baru){ return faktorSkalaVolZN(baru) * faktorSkalaPPMZN(kanal, baru); }
-// Batas aman Kp/Ki ZN thd gain model g (per iterasi PI: a = g.Kp, b = g.Ki):
-//   a <= 0.5 (FRAKSI_AMAN_ZN; Ki ikut diredam sebanding)  dan  TES_141: b <= a^2/4 (akar riil -> tanpa osilasi/overshoot)
-void batasAmanKpKiZN(float &kp, float &ki, float g){
-  if(!(g>0.0f)) return;
-  float kpMaks = FRAKSI_AMAN_ZN/g;
-  if(kp>kpMaks){ ki *= kpMaks/kp; kp = kpMaks; }
-  float kiMaks = ZN_RASIO_KI_AKAR_RIIL*g*kp*kp;
-  if(ki>kiMaks) ki = kiMaks;
+// ── v1.2: PI ZN VERSI B — KOREKSI PENCUPLIKAN ──
+// Rumus ZN (kurva reaksi) menganggap pengendali bekerja terus-menerus. Di alat ini pengendali TERCUPLIK: satu pulsa,
+// tunggu homogenisasi, ukur ulang (periode dt). Akibatnya rumus apa adanya memberi g.Kp = 0,9T/L (> 1 utk T > 1,1L):
+// satu pulsa melebihi dosis yang dibutuhkan (overshoot tak bisa dikoreksi, aktuator satu arah).
+// Pencuplikan + penahanan dianggap setara tambahan waktu tunda dt/2 -> L' = L + dt/2. Profil menyimpan Kp/Ki rumus ZN
+// apa adanya; karena Ki/Kp = 0,3/L dan T/K = Kp.L/0,9, nilai yang dipakai:  Kp' = Kp.L/L'  dan  Ki' = Ki.(L/L')^2.
+// dt nominal = jeda homogenisasi kanal (J2 PPM, J4 pH) + waktu satu pengukuran
+//            = stabil daya sensor 5 dtk + bilas D1 + stabilisasi + jendela median 20 dtk.
+float dtCuplikZN(int kanal, bool baru){
+  int j     = baru ? dosingJedaHomogenisasiBaru[kanal==0 ? 1 : 3] : dosingJedaHomogenisasi[kanal==0 ? 1 : 3];
+  int bilas = baru ? terpilihLamaCekSensorBaru : terpilihLamaCekSensor;
+  int stab  = baru ? terpilihJedaStabilisasiBaru : terpilihJedaStabilisasi;
+  if(j < 0) j = 0;
+  if(bilas < 0) bilas = 0;
+  if(stab < 0) stab = 0;
+  return (float)j*60.0f + (float)(JEDA_STABIL_SENSOR_DETIK + bilas + stab + ROLL_MED_N);
+}
+// Waktu tunda L (detik) dari pasangan Kp/Ki rumus ZN: Ki/Kp = 0,27T/(K.L^2) / (0,9T/(K.L)) = 0,3/L
+float waktuTundaZN(float kp, float ki){ return (kp>0.0f && ki>0.0f) ? (0.3f*kp/ki) : 0.0f; }
+// Kp/Ki rumus ZN -> Kp'/Ki' versi B (tanpa batas aman / pemotongan)
+void koreksiCuplikZN(float &kp, float &ki, int kanal, bool baru){
+  float L = waktuTundaZN(kp, ki);
+  if(L <= 0.0f) return;
+  float r = L / (L + 0.5f*dtCuplikZN(kanal, baru));
+  kp *= r;
+  ki *= r*r;
 }
 // Status profil ZN konteks: 0 = OK, 1 = belum ada, 2 = tidak cocok konfigurasi, 3 = belum lengkap
 // TES_144: bit kanal 'uji lama' yang dipakai proses (PPM & pH atas selalu; pH bawah bila target < 5.85) & terisi
@@ -7928,13 +8960,13 @@ byte statusProfilZN(bool baru){
   if(!profilZNLengkap(p, baru ? terpilihPHBaru : terpilihPH)) return 3;
   return 0;
 }
-// Kp/Ki ZN efektif satu kanal (0=PPM, 1=pH atas, 2=pH bawah) setelah batas aman model
+// Kp/Ki ZN yang DIPAKAI satu kanal (0=PPM, 1=pH atas, 2=pH bawah): skala volume/PPM lalu koreksi pencuplikan (v1.2)
 void kpKiZNEfektif(int kanal, bool baru, float &kp, float &ki){
   const ProfilKpKiZN &p = profilZNKonteks(baru);
   kp = (kanal==0) ? p.kpPPM : (kanal==1 ? p.kpPHAtas : p.kpPHBawah);
   ki = (kanal==0) ? p.kiPPM : (kanal==1 ? p.kiPHAtas : p.kiPHBawah);
   float f = faktorSkalaZN(kanal, baru); kp *= f; ki *= f;   // TES_141: volume uji -> Parameter, PPM uji -> target
-  batasAmanKpKiZN(kp, ki, hitungGainModel(kanal, baru));
+  koreksiCuplikZN(kp, ki, kanal, baru);                      // v1.2: L' = L + dt/2, tanpa pemotongan
 }
 int jumlahBarisPI(bool baru){
   int mode = baru ? dosingModeBaru : dosingMode;
@@ -8325,7 +9357,7 @@ void tampilkanSubMenuD(){
   lcdPrintCenter(0,F("MODE KALKULATOR"));
   for(int i=0;i<3;i++){
     int idx=scrollMenuD+i;
-    if(idx<TOTAL_MENU_D_ROWS) lcdPrint20(0,i+1,(idx==selMenuD?"> ":"  ")+String(menuDOptions[idx]));
+    if(idx<TOTAL_MENU_D_ROWS) lcdPrint20(0,i+1,(idx==selMenuD?"> ":"  ")+String(FPGM(menuDOptions,idx)));
     else lcdPrint20(0,i+1,"");
   }
 }
@@ -8542,7 +9574,7 @@ void tampilkanInputBatasPH(){
 void tampilkanMenuJenisDosing(){
   lcdPrintCenter(0,F("JENIS DOSING"));
   for(int i=0;i<TOTAL_JENIS_DOSING_OPTIONS;i++){
-    lcdPrint20(0,i+1, String(selJenisDosing==i?"> ":"  ") + String(jenisDosingOptions[i]));
+    lcdPrint20(0,i+1, String(selJenisDosing==i?"> ":"  ") + String(FPGM(jenisDosingOptions,i)));
   }
 }
 // Layar input besar makro dosing. Baris 2 menjelaskan pembagian sesuai jenis yang dipilih.
@@ -8614,9 +9646,9 @@ void prosesInputECBebas(char key){
 // (tidak mengganggu jadwal yang sedang berjalan; dipakai saat Parameter Baru di-commit). Selain itu -> profil AKTIF.
 void tampilkanMenuZNHub(){
   lcdPrintCenter(0, tampilBaru() ? F("Kp/Ki PI ZN (Baru)") : F("Kp/Ki PI ZN"));
-  lcdPrint20(0,1, String(selZNHub==0?"> ":"  ")+String(znHubOptions[0]));
-  lcdPrint20(0,2, String(selZNHub==1?"> ":"  ")+String(znHubOptions[1]));   // TES_145: Rekaman Terakhir
-  lcdPrint20(0,3, String(selZNHub==2?"> ":"  ")+(tampilBaru() ? String(F("Lihat Kp/Ki Baru")) : String(znHubOptions[2])));   // TES_127
+  lcdPrint20(0,1, String(selZNHub==0?"> ":"  ")+String(FPGM(znHubOptions,0)));
+  lcdPrint20(0,2, String(selZNHub==1?"> ":"  ")+String(FPGM(znHubOptions,1)));   // TES_145: Rekaman Terakhir
+  lcdPrint20(0,3, String(selZNHub==2?"> ":"  ")+(tampilBaru() ? String(F("Lihat Kp/Ki Baru")) : String(FPGM(znHubOptions,2))));   // TES_127
 }
 
 // TES_145: layar 'Rekaman Terakhir'. AB Mix: judul baris 0, data baris 1-3. pH Down: judul baris 0, fase baris 1, data baris 2-3.
@@ -8779,8 +9811,8 @@ bool validasiKpKiZNParameterBaru(){
 // -- Poin 3: tampilan Kp/Ki, 3 kategori bisa digeser --
 void tampilkanKpKiZN(){
   // AVR snprintf tidak mendukung %f -> angka diformat dgn dtostrf (fmtKp).
-  // Bila nilai tersimpan melewati batas aman model (mis. PPM target/debit berubah setelah uji), nilai EFEKTIF
-  // yang benar-benar dipakai saat dosing ditampilkan di samping ("ef").
+  // v1.2: kiri = nilai rumus ZN tersimpan, kanan "ef" = nilai yang dipakai saat dosing (skala volume/PPM +
+  // koreksi pencuplikan L' = L + dt/2).
   char judul[21],baris1[21],baris2[21],a[12],b[12];
   bool baru = tampilBaru();   // Baru bila draft Parameter Baru ada
   const ProfilKpKiZN &p = profilZNKonteks(baru);
@@ -8799,7 +9831,7 @@ void tampilkanKpKiZN(){
     else if(halKpKiZN==1) snprintf_P(judul,sizeof(judul),tdk?PSTR("pH Atas: TDK COCOK"):PSTR("pH Atas: BELUM ADA"));
     else                  snprintf_P(judul,sizeof(judul),tdk?PSTR("pH Bawah: TDK COCOK"):PSTR("pH Bawah: BELUM ADA"));
   }
-  if(kp>0.0f && (fabs(kpEf-kp) > kp*0.001f || fabs(kiEf-ki) > ki*0.001f+1e-9f)){   // TES_141: skala volume/PPM atau batas aman
+  if(kp>0.0f && (fabs(kpEf-kp) > kp*0.001f || fabs(kiEf-ki) > ki*0.001f+1e-9f)){   // skala volume/PPM & koreksi pencuplikan (v1.2)
     fmtDuaKp(baris1,"Kp",kp,"ef",kpEf);
     fmtDuaKp(baris2,"Ki",ki,"ef",kiEf);
   } else {
@@ -8813,12 +9845,8 @@ void tampilkanKpKiZN(){
 }
 
 // TES_141: Ki maks edit manual = min(0.6 Kp, 0.25.g.Kp^2) pada gain model Parameter konteks
-float kiMaksEdit(int kanal, float kp){
-  float m = 0.6f*kp;
-  float g = hitungGainModel(kanal, tampilBaru());
-  if(g>0.0f){ float r = ZN_RASIO_KI_AKAR_RIIL*g*kp*kp; if(r<m) m=r; }
-  return m;
-}
+// v1.2: isian manual = nilai rumus ZN. Ki/Kp = 0,3/L dan L >= 0,5 dtk -> Ki <= 0,6.Kp (tanpa batas gain model)
+float kiMaksEdit(int kanal, float kp){ return 0.6f*kp; }
 void tampilkanEditKpKiZN(){
   lcdPrintCenter(0, znEditTahap==0?F("Input Kp:"):F("Input Ki:"));
   lcdPrintCenter(2,(inputBuffer.length()>0?inputBuffer:"_"));
@@ -8833,28 +9861,12 @@ void prosesEditKpKiZN(char key){
     if(inputBuffer.length()==0) return;
     float nilai = inputBuffer.toFloat();
     if(znEditTahap==0){
-      // Kp harus > 0 dan <= batas aman kanal ini (sama dgn cap pada hasil Uji Reaksi: FRAKSI_AMAN_ZN / gain model)
-      float kpMaks = kpMaksModel(halKpKiZN, tampilBaru());   // pemetaan kanal sama: 0=PPM, 1=pH Atas, 2=pH Bawah
-      if(kpMaks<=0.0f){   // TES_138: gain model tak valid (parameter belum lengkap) -> batas aman tak bisa dihitung
+      // v1.2: Kp = nilai rumus ZN (tanpa batas aman gain model); cukup > 0
+      if(nilai<=0.0f){
         lcd.clear();
-        lcdPrintCenter(0,F("Parameter belum"));
-        lcdPrintCenter(1,F("lengkap: batas aman"));
-        lcdPrintCenter(2,F("Kp tak bisa dihitung"));
-        jedaInfo(3000);
-        inputBuffer=""; currentState=MENU_LIHAT_KPKI_ZN; lcd.clear(); tampilkanKpKiZN();
-        return;
-      }
-      // TES_138: batas bawah 1% (dulu 10%: rasionalnya 'dosis < deadband' tak berlaku lagi sejak pulsa min 1 dtk;
-      // Kp hasil uji reaksi < 10% batas aman tak bisa dikonfirmasi ulang). 1% = penjaga salah ketik.
-      float kpMin  = 0.01f*kpMaks;
-      if(nilai<=0.0f || nilai>kpMaks*1.002f || nilai<kpMin*0.998f){   // toleransi pembulatan 0,2%
-        lcd.clear();
-        lcdPrintCenter(0,F("Kp di luar batas"));
-        char ka[12], kb[12]; fmtKp(ka,kpMin*1.006f); fmtKp(kb,kpMaks*0.994f);   // dibulatkan ke DALAM rentang
-        char bm[21]; snprintf(bm,sizeof(bm),"%s - %s",ka,kb);
-        lcdPrintCenter(1,bm);
-        lcdPrintCenter(2,F("(1-100% batas aman"));
-        lcdPrintCenter(3,F("anti overshoot)"));
+        lcdPrintCenter(0,F("Kp harus > 0"));
+        lcdPrintCenter(1,F("(nilai rumus ZN:"));
+        lcdPrintCenter(2,F("Kp = 0,9T/(K.L))"));
         jedaInfo(3000);
         inputBuffer=""; lcd.clear(); tampilkanEditKpKiZN();
         return;
@@ -8862,24 +9874,24 @@ void prosesEditKpKiZN(char key){
       znEditKpSementara = nilai;
       inputBuffer=""; znEditTahap=1;
       { const ProfilKpKiZN &pz = profilZNKonteks(tampilBaru());
-        float kpE, ki; kpKiZNEfektif(halKpKiZN, tampilBaru(), kpE, ki);   // TES_141: nilai efektif
+        float ki = faktorSkalaZN(halKpKiZN, tampilBaru()) *
+                   ((halKpKiZN==0) ? pz.kiPPM : (halKpKiZN==1 ? pz.kiPHAtas : pz.kiPHBawah));   // v1.2: nilai rumus ZN (skala Parameter)
         float kiMaks = kiMaksEdit(halKpKiZN, nilai);
         if(ki > kiMaks) ki = kiMaks;
         char t[12]=""; if(pz.terisi && ki>0.0f) fmtIsiKp(t, ki);
         isiAwalLangsung(t); }   // TES_127: Ki diisi nilai yang sedang dipakai
       tampilkanEditKpKiZN();
     } else {
-      // Ki boleh 0 (= kontrol P murni). Batas atas: Ki <= 0.6 Kp (rumus ZN PI: Ki/Kp = 0.3/D, dan D >= 0.5 dtk) dan
-      // TES_141: g.Ki <= (g.Kp)^2/4 (akar karakteristik PI per iterasi riil -> tanpa osilasi/overshoot)
+      // v1.2: Ki > 0 (L = 0,3.Kp/Ki dipakai koreksi pencuplikan) dan Ki <= 0,6 Kp (L >= 0,5 dtk)
       float kiMaks = kiMaksEdit(halKpKiZN, znEditKpSementara);
-      if(nilai > kiMaks*1.002f){   // toleransi 0,2%: pembulatan tampilan isi awal
+      if(nilai <= 0.0f || nilai > kiMaks*1.002f){   // toleransi 0,2%: pembulatan tampilan isi awal
         lcd.clear();
         lcdPrintCenter(0,F("Ki di luar batas"));
         char kb[12]; fmtKp(kb,kiMaks*0.994f);   // TES_138: dibulatkan ke dalam rentang
-        char bm[21]; snprintf(bm,sizeof(bm),"Rentang 0 - %s",kb);
+        char bm[21]; snprintf(bm,sizeof(bm),"Rentang >0 - %s",kb);
         lcdPrintCenter(1,bm);
-        lcdPrintCenter(2,F("(Ki maks: tanpa"));
-        lcdPrintCenter(3,F("osilasi/overshoot)"));
+        lcdPrintCenter(2,F("(Ki/Kp = 0,3/L,"));
+        lcdPrintCenter(3,F("L >= 0,5 detik)"));
         jedaInfo(3000);
         inputBuffer=""; lcd.clear(); tampilkanEditKpKiZN();
         return;
@@ -8900,7 +9912,7 @@ void prosesEditKpKiZN(char key){
 
 void tampilkanUjiZNPilihKanal(){
   lcdPrintCenter(0, tampilBaru() ? F("Uji kanal (P. Baru)") : F("Uji kanal mana?"));
-  for(int i=0;i<3;i++) lcdPrint20(0,i+1, String(ujiKanalDipilih==i?"> ":"  ")+String(ujiKanalOptions[i]));
+  for(int i=0;i<3;i++) lcdPrint20(0,i+1, String(ujiKanalDipilih==i?"> ":"  ")+String(FPGM(ujiKanalOptions,i)));
 }
 
 // Baca 1 nilai sensor sesuai kanal uji yang dipilih (0=PPM/TDS, 1&2=pH)
@@ -9485,10 +10497,8 @@ void selesaiUjiStepResponse(bool stabil){
   float KiRaw = 0.27f*tau/(D*D);
   float Kp = KpRaw/K_uji;
   float Ki = KiRaw/K_uji;
-  // TES_141: batas aman thd gain model TANGKI UJI (volume uji, kanal pH: PPM terukur) + batas Ki akar riil
+  // v1.2: Kp/Ki rumus ZN disimpan APA ADANYA (tanpa batas aman); koreksi pencuplikan diterapkan saat dipakai.
   hasilUjiPPMAcuan = ujiPPMAcuan();
-  float KModel = gainUji(ujiKanalDipilih, hasilUjiPPMAcuan);
-  batasAmanKpKiZN(Kp, Ki, KModel);
   hasilUjiTau=tau; hasilUjiD=D; hasilUjiK=K_uji; hasilUjiKp=Kp; hasilUjiKi=Ki;
   currentState=UJI_ZN_KONFIRMASI;
   lcd.clear();
@@ -9781,6 +10791,7 @@ void hentikanDosingSensorInvalid(){
 // Sensor TDS HANYA aktif (relay daya ON) pada: kalibrasi TDS, fase cek PPM dosing,
 // tahap PPM pada Cek Akhir, Tes Sensor TDS, dan sekali saat boot.
 bool sensorTdsPerluAktif(){
+  if(pantauFase==3 || pantauFase==4) return true;   // v1.3: sampel pantau (daya TDS & ukur PPM)
   switch(currentState){
     case MENU_KAL_TDS_SAMPEL:
     case DOSING_CEK_PPM1: case DOSING_CEK_PPM2: case DOSING_CEK_PPM3: case DOSING_PI_CEK_PPM:
@@ -9797,6 +10808,7 @@ bool sensorTdsPerluAktif(){
 }
 // Sensor pH dibaca pada: kalibrasi pH, fase cek pH dosing, tahap pH Cek Akhir, Tes Sensor pH.
 bool sensorPhPerluAktif(){
+  if(pantauFase==5 || pantauFase==6) return true;   // v1.3: sampel pantau (stabil & ukur pH)
   switch(currentState){
     case MENU_KAL_PH_SAMPEL:
     case DOSING_CEK_PH1:  case DOSING_CEK_PH2:  case DOSING_PI_CEK_PH:
@@ -9838,6 +10850,10 @@ void gambarUlangLayarAktif(){
     case MENU_PERSEN_MAKRO:     tampilkanInputPersenMakro();   break;
     case ZN_KONFIRMASI_JADWAL:  tampilkanZNKonfirmasiJadwal(); break;
     case MENU_KUNCI_KANAL:      tampilkanMenuKunciKanal();     break;
+    case MENU_UJI_KINERJA:      tampilkanMenuUjiKinerja();     break;   // v1.3
+    case UJI_KIN_INPUT_INTERVAL: case UJI_KIN_INPUT_BILAS: case UJI_KIN_INPUT_AKHIR: tampilkanUjiKinInput(); break;
+    case UJI_KIN_MULAI_KONF:    tampilkanUjiKinMulaiKonf();    break;
+    case UJI_PANTAU_AKHIR:      tampilkanPantauAkhir();        break;
     case RESOLUSI_PERINGATAN:   tampilkanPeringatanResolusi(); break;
     case KUNCI_KANAL_KONFIRMASI: tampilkanKunciKanalKonfirmasi(); break;
     case MENU_EC_BEBAS:         tampilkanInputECBebas();       break;
@@ -9932,6 +10948,8 @@ void gambarUlangLayarAktif(){
     case KALK_PH_HASIL:         tampilkanKalkPHHasil();        break;
     // Pengaturan sistem / persamaan
     case MENU_PENGATURAN_SISTEM:    tampilkanMenuPengaturanSistem();    break;
+    case MENU_RIWAYAT_LIST:         tampilkanRiwayatList();             break;   // v1.1
+    case MENU_RIWAYAT_DETAIL:       tampilkanRiwayatDetail();           break;   // v1.1
     case MENU_PENGATURAN_PERSAMAAN: tampilkanMenuPengaturanPersamaan(); break;
     case PENGATURAN_AB_PILIH_DIL:   tampilkanPengaturanABPilihDil();    break;
     case PENGATURAN_AB_LIST:        tampilkanPengaturanABList();        break;
@@ -10062,7 +11080,8 @@ void tampilkanDosingHomogenisasi(){
   int jedaMenit = jedaUntukState(currentState);
   int menitBerjalan = dosingHomogenDetikBerjalan/60;
   lcdCenterP(2, PSTR("%d/%d menit"), menitBerjalan, jedaMenit);
-  lcdBar(3, dosingHomogenDetikBerjalan, (long)jedaMenit*60L);
+  if(ujiPantauAktif && sdLogAktif){ char b[21]; teksFasePantau(b, sizeof(b), true); lcdPrintCenter(3, b); }   // v1.3
+  else lcdBar(3, dosingHomogenDetikBerjalan, (long)jedaMenit*60L);
 }
 
 void tampilkanDosingCekAkhir(){
@@ -10095,7 +11114,19 @@ void tampilkanCancelDosing(){
 bool siklusSedangBerjalan(){ return statusFaseDosingBerjalan(currentState) && currentState!=DOSING_TUNGGU_WAKTU; }
 
 const __FlashStringHelper* labelFaseDosing(){
+  if(pantauFase){   // v1.3: sampel pantau Uji Kinerja
+    switch(pantauFase){
+      case 1:  return F("Pantau: bilas");
+      case 2:  return F("Pantau: stabil");
+      case 3:  return F("Pantau: daya TDS");
+      case 4:  return F("Pantau: ukur PPM");
+      case 5:  return F("Pantau: stabil pH");
+      case 6:  return F("Pantau: ukur pH");
+      default: return F("Pantau: hasil");
+    }
+  }
   switch(currentState){
+    case UJI_PANTAU_AKHIR: case UJI_KIN_MULAI_KONF: return F("Pantau akhir");
     case DOSING_ISI_TANDON:    return F("Mengisi tandon..");
     case DOSING_JEDA_PULIH:    return F("Homogenisasi pulih");
     case DOSING_JEDA_ISI:      return isiAdaAirBaru ? F("Homogenisasi air") : F("Stabilisasi tandon");
@@ -10240,7 +11271,7 @@ void tampilkanMenuPengaturanSistem(){
   lcdPrintCenter(0,F("PENGATURAN SISTEM"));
   for(int i=0;i<3;i++){
     int idx=scrollPengaturanSistem+i;
-    if(idx<TOTAL_PENGATURAN_SISTEM_ROWS) lcdPrint20(0,i+1,(idx==selPengaturanSistem?"> ":"  ")+String(pengaturanSistemOptions[idx]));
+    if(idx<TOTAL_PENGATURAN_SISTEM_ROWS) lcdPrint20(0,i+1,(idx==selPengaturanSistem?"> ":"  ")+String(FPGM(pengaturanSistemOptions,idx)));
     else lcdPrint20(0,i+1,"");
   }
 }
@@ -10303,6 +11334,10 @@ void resetPabrik(){
   // TES_145: rekaman kurva uji terakhir (cukup kosongkan magic + jumlah titik; data kanal tak dibaca tanpa magic)
   for(unsigned int i=0;i<8;i++){
     EEPROM.update(EEPROM_ALAMAT_ZNREK + i, 0xFF); wdt_reset();
+  }
+  // v1.3: setelan Uji Kinerja
+  for(unsigned int i=0;i<sizeof(KonfigUjiKinerja);i++){
+    EEPROM.update(EEPROM_ALAMAT_UJIKIN + i, 0xFF); wdt_reset();
   }
   jedaAman(1500);
   // TES_150: restart TANPA watchdog. Sesudah reset oleh watchdog, ATmega2560 menyalakan watchdog lagi dgn waktu
